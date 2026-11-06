@@ -4,14 +4,14 @@
     "core_index": ["SPY"],
     "core_value": ["BRK-B"],
     "megacap_quality": ["AAPL", "MSFT", "GOOG"],
-    "ai_growth": ["NVDA", "CRWV", "PLTR", "DRAM", "TSLA", "SPCX", "P", "NOK", "NBIS", "SKHY", "DISK", "NOW", "WDC", "SNDK", "NET", "ASML", "INTC", "AMD", "TSM", "ON"]
+    "ai_growth": ["NVDA", "CRWV", "PLTR", "DRAM", "TSLA", "SPCX", "P", "NOK", "NBIS", "SKHY", "DISK", "NOW", "WDC", "SNDK", "NET", "ASML", "INTC", "AMD", "TSM", "ON", "U"]
   },
   "subthemes": {
     "ai_energy": ["VST", "BE", "SMR", "FSLR"],
     "ai_memory_storage": ["DRAM", "DISK", "WDC", "SNDK", "SKHY", "P"],
     "ai_compute_semis": ["NVDA", "AMD", "TSM", "ASML", "INTC", "ON"],
     "ai_network_fibre": ["NET", "NOK"],
-    "ai_cloud_software": ["CRWV", "NBIS", "NOW", "PLTR", "MSFT", "GOOG", "GOOGL"],
+    "ai_cloud_software": ["CRWV", "NBIS", "NOW", "PLTR", "MSFT", "GOOG", "GOOGL", "U"],
     "physical_ai": ["TSLA", "RKLB", "SPCX"]
   },
   "subtheme_labels": {
