@@ -20,7 +20,8 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -29,9 +30,36 @@ import pandas as pd
 ADDON_DIR = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.getenv("FM_DATA_ROOT", "/home/appuser/.tradingagents"))
 DEFAULT_MODEL = os.getenv("FUND_MANAGER_MODEL", "openai/gpt-6.1-sol")
+# Quick model already used for per-stock runs (cli prefs: openai/gpt-6-luna).
+# The conservative seat used to default to anthropic/claude-opus-5.5 (~$0.39 of a
+# ~$1.20 committee). Opus is not a default anywhere in this add-on: it is the
+# expensive seat and easy to leave on. Luna takes that seat, and also the neutral
+# seat so the neutral voice is not the fund manager's own Sol model.
+QUICK_MODEL = "openai/gpt-6-luna"
 OPENROUTER_BASE = os.getenv("FUND_MANAGER_BASE_URL", "https://openrouter.ai/api/v1")
 BENCH = "SPY"
 TRADING_DAYS = 252
+REGIME_SYMBOLS = ["QQQ", "SMH", "IWM", "^VIX", "^VIX3M"]
+# GOOG/MSFT/AAPL sit in megacap_quality, not ai_growth. Count them, plus this
+# fraction of SPY (mega-cap tech share of the index), in the AI sleeve.
+AI_MEGACAP = {"AAPL", "MSFT", "GOOG", "GOOGL"}
+SPY_TECH_SHARE = 0.33
+FRED_LOOKBACK_DAYS = 800
+FRED_MONTHLY = {"fed_funds", "core_cpi_index", "unemployment"}
+RISK_POLICY = {
+    "single_stock_cap_pct": 12.0,
+    "high_vol_cap_pct": 3.0,
+    "high_vol_threshold_pct": 60.0,
+    "short_history_cap_pct": 2.0,
+    "short_history_bars": 252,
+    "broad_index_cap_pct": 35.0,
+    "ai_sleeve_cap_pct": 35.0,
+    "spy_tech_share": SPY_TECH_SHARE,
+    "ai_megacap": sorted(AI_MEGACAP),
+    "top3_cap_pct": 50.0,
+    "min_trade_usd": 500.0,
+    "earnings_warn_days": 7,
+}
 
 
 def log(msg: str) -> None:
@@ -169,6 +197,15 @@ def fetch_prices(tickers: list[str], period: str = "2y") -> pd.DataFrame:
     raise RuntimeError("Could not download price history from yfinance")
 
 
+def fetch_prices_with_regime(tickers: list[str]) -> pd.DataFrame:
+    """Holdings plus the regime tape. A bad index symbol must not sink the book download."""
+    try:
+        return fetch_prices(list(tickers) + REGIME_SYMBOLS)
+    except RuntimeError:
+        log("price download failed with regime symbols; retrying holdings only")
+        return fetch_prices(list(tickers))
+
+
 def live_quotes(tickers: list[str], close: pd.DataFrame) -> dict:
     """Best-effort latest price; falls back to last daily close."""
     import yfinance as yf
@@ -214,17 +251,22 @@ def fred_snapshot(as_of: str) -> dict:
               "10y_2y_spread": "T10Y2Y", "vix": "VIXCLS", "core_cpi_index": "CPILFESL",
               "unemployment": "UNRATE", "dollar_index": "DTWEXBGS"}
     out = {}
-    start = (datetime.strptime(as_of, "%Y-%m-%d") - timedelta(days=400)).strftime("%Y-%m-%d")
+    as_of_dt = datetime.strptime(as_of, "%Y-%m-%d")
+    # 800 days so a lagged monthly print still has an observation ~365 days earlier (CPI YoY).
+    start = (as_of_dt - timedelta(days=FRED_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     for name, sid in series.items():
         try:
             data = fred._request("series/observations", {
                 "series_id": sid, "observation_start": start, "observation_end": as_of,
-                "sort_order": "desc", "limit": 300})
+                "sort_order": "desc", "limit": 900})
             obs = [o for o in data.get("observations", []) if o.get("value") not in (".", None)]
             if not obs:
                 continue
             latest = obs[0]
-            entry = {"date": latest["date"], "value": float(latest["value"])}
+            age = (as_of_dt - datetime.strptime(latest["date"], "%Y-%m-%d")).days
+            limit = 45 if name in FRED_MONTHLY else 4
+            entry = {"date": latest["date"], "value": float(latest["value"]), "age_days": age,
+                     "stale": age > limit}
             # value ~1 year earlier for context
             target = (datetime.strptime(latest["date"], "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
             older = [o for o in obs if o["date"] <= target]
@@ -309,21 +351,94 @@ def _beta(a: pd.Series, b: pd.Series) -> float | None:
 
 def _trend_stats(p: pd.Series) -> dict:
     p = p.dropna()
-    if len(p) < 6:
-        return {}
+    n = len(p)
+    if n < 2:
+        return {"history_bars": int(n)}
+    last = float(p.iloc[-1])
+    out: dict = {"history_bars": int(n),
+                 "ret_1d_pct": round((last / float(p.iloc[-2]) - 1) * 100, 2)}
+    if n >= 6:
+        out["ret_5d_pct"] = round((last / float(p.iloc[-6]) - 1) * 100, 2)
+    if n < 6:
+        return out
     y = p.tail(TRADING_DAYS + 1)
-    sma50, sma200 = float(p.tail(50).mean()), float(p.tail(200).mean())
-    dd = y / y.cummax() - 1
-    return {
-        "ret_1m_pct": round(float(y.iloc[-1] / y.iloc[max(-22, -len(y))] - 1) * 100, 1),
-        "ret_3m_pct": round(float(y.iloc[-1] / y.iloc[max(-64, -len(y))] - 1) * 100, 1),
-        "ret_1y_pct": round(float(y.iloc[-1] / y.iloc[0] - 1) * 100, 1),
-        "from_52w_high_pct": round(float(y.iloc[-1] / y.max() - 1) * 100, 1),
-        "sma50": round(sma50, 2), "sma200": round(sma200, 2),
-        "vs_sma50_pct": round((float(p.iloc[-1]) / sma50 - 1) * 100, 1),
-        "vs_sma200_pct": round((float(p.iloc[-1]) / sma200 - 1) * 100, 1),
-        "max_drawdown_1y_pct": round(float(dd.min() * 100), 1),
-    }
+    out["ret_1m_pct"] = round((last / float(y.iloc[max(-22, -len(y))]) - 1) * 100, 1)
+    out["ret_3m_pct"] = round((last / float(y.iloc[max(-64, -len(y))]) - 1) * 100, 1)
+    out["from_52w_high_pct"] = round((last / float(y.max()) - 1) * 100, 1)
+    if n >= TRADING_DAYS:
+        out["ret_1y_pct"] = round((last / float(y.iloc[0]) - 1) * 100, 1)
+        dd = y / y.cummax() - 1
+        out["max_drawdown_1y_pct"] = round(float(dd.min() * 100), 1)
+    if n >= 50:
+        sma50 = float(p.tail(50).mean())
+        out["sma50"] = round(sma50, 2)
+        out["vs_sma50_pct"] = round((last / sma50 - 1) * 100, 1)
+    if n >= 200:
+        sma200 = float(p.tail(200).mean())
+        out["sma200"] = round(sma200, 2)
+        out["vs_sma200_pct"] = round((last / sma200 - 1) * 100, 1)
+    return out
+
+
+def _atr_stop(p: pd.Series) -> float | None:
+    """Downside level from a close-to-close ATR proxy. High/low are not in the close frame."""
+    p = p.dropna()
+    if len(p) < 15:
+        return None
+    atr = float(p.diff().abs().tail(14).mean())
+    px = float(p.iloc[-1])
+    low20 = float(p.tail(20).min())
+    dist = max(2.5 * atr, px - low20)
+    if not math.isfinite(dist) or dist <= 0:
+        return None
+    return round(px - dist, 2)
+
+
+def _earnings_info(tk: str, today: date) -> dict:
+    import yfinance as yf
+    try:
+        frame = yf.Ticker(tk).get_earnings_dates(limit=12)
+        index = getattr(frame, "index", None)
+        if frame is None or index is None or len(index) == 0:
+            return {}
+        dates = []
+        for idx in list(index):
+            raw = idx.date() if hasattr(idx, "date") else None
+            if isinstance(raw, datetime):
+                raw = raw.date()
+            if isinstance(raw, date):
+                dates.append(raw)
+        if not dates:
+            return {}
+        future = sorted(d for d in dates if d >= today)
+        if not future:
+            return {"last": max(dates).isoformat()}
+        nxt = future[0]
+        return {"date": nxt.isoformat(), "calendar_days": (nxt - today).days}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:160]}
+
+
+def speaking_order(rnd: int, anchor: str) -> tuple[str, ...]:
+    """Rotate who opens, so a one-round debate does not always end on neutral.
+
+    The seat advances once per round and once per calendar day of the decision date.
+    """
+    roles = ("aggressive", "conservative", "neutral")
+    try:
+        ordinal = datetime.strptime(anchor, "%Y-%m-%d").date().toordinal()
+    except ValueError:
+        ordinal = date.today().toordinal()
+    start = (ordinal + rnd - 1) % len(roles)
+    return roles[start:] + roles[:start]
+
+
+def _without_opus(model: str, allow_opus: bool, seat: str) -> str:
+    if allow_opus or "opus" not in (model or "").lower():
+        return model
+    log(f"{seat} model {model} is an Opus model, which this add-on does not use by default (cost). "
+        f"Using {QUICK_MODEL} instead. Pass --allow-opus to keep it.")
+    return QUICK_MODEL
 
 
 def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, targets: dict | None,
@@ -365,7 +480,10 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
         s1 = win1[tk].dropna()
         ent = {"ann_vol_pct": round(float(s1.std() * math.sqrt(TRADING_DAYS) * 100), 1), "obs_1y": int(len(s1))}
         if bench1 is not None:
-            b1, b2 = _beta(s1, bench1), _beta(win2[tk].dropna(), bench2)
+            s2 = win2[tk].dropna()
+            b1 = _beta(s1, bench1)
+            # A short history makes the 2y window the same sample as the 1y window. Do not copy it.
+            b2 = _beta(s2, bench2) if len(s2) >= len(s1) + 40 else None
             ent["beta_1y"] = round(b1, 2) if b1 is not None else None
             ent["beta_2y"] = round(b2, 2) if b2 is not None else None
             ent["corr_spy_1y"] = round(float(win1[tk].corr(bench1)), 2)
@@ -377,9 +495,21 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                 ent["beta_unstable"] = True
                 data_checks.append(f"{tk}: 1y beta {b1:.2f} vs 2y beta {b2:.2f} - unstable; stress uses {ent['stress_beta']}")
         ent.update(_trend_stats(close[tk]))
+        if tk in close:
+            ent["atr_stop"] = _atr_stop(close[tk])
         per[tk] = ent
     for r in rows:
         r.update(per.get(r["ticker"], {}))
+        kind = (r.get("type") or "").lower()
+        if kind != "etf" and r["ticker"] != BENCH:
+            earn = _earnings_info(r["ticker"], date.today())
+            if earn:
+                r["earnings"] = earn
+                if earn.get("calendar_days") is not None and earn["calendar_days"] <= RISK_POLICY["earnings_warn_days"]:
+                    data_checks.append(
+                        f"{r['ticker']}: earnings {earn.get('date')} in {earn['calendar_days']} calendar days")
+                elif earn.get("error"):
+                    data_checks.append(f"{r['ticker']}: earnings calendar unavailable ({earn['error']})")
 
     # portfolio-level (1y window, current weights, cash earns 0)
     w = pd.Series({r["ticker"]: (r["market_value"] or 0) / total for r in rows})
@@ -450,10 +580,38 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     above50 = [r["ticker"] for r in rows if r.get("vs_sma50_pct") is not None and r["vs_sma50_pct"] > 0]
     regime["holdings_above_sma200"] = f"{len(above200)}/{len(rows)}"
     regime["holdings_above_sma50"] = f"{len(above50)}/{len(rows)}"
+    for sym, label in (("QQQ", "qqq"), ("SMH", "smh"), ("IWM", "iwm")):
+        if sym in close:
+            st = _trend_stats(close[sym])
+            regime[f"{label}_ret_1d_pct"] = st.get("ret_1d_pct")
+            regime[f"{label}_ret_5d_pct"] = st.get("ret_5d_pct")
+    if "^VIX" in close:
+        vx = close["^VIX"].dropna()
+        if len(vx):
+            age = (date.today() - vx.index[-1].date()).days
+            regime["vix_yahoo"] = {"value": round(float(vx.iloc[-1]), 2), "date": str(vx.index[-1].date()),
+                                   "age_days": age, "source": "yfinance ^VIX", "stale": age > 4}
+            if age > 4:
+                data_checks.append(f"^VIX is stale: {regime['vix_yahoo']['value']} on {regime['vix_yahoo']['date']} ({age} days)")
+    if "^VIX3M" in close:
+        v3 = close["^VIX3M"].dropna()
+        if len(v3):
+            age = (date.today() - v3.index[-1].date()).days
+            regime["vix3m_yahoo"] = {"value": round(float(v3.iloc[-1]), 2), "date": str(v3.index[-1].date()),
+                                     "age_days": age, "source": "yfinance ^VIX3M", "stale": age > 4}
     if macro:
-        for k in ("vix", "10y_treasury", "2y_treasury", "10y_2y_spread", "fed_funds"):
-            if isinstance(macro.get(k), dict) and "value" in macro[k]:
-                regime[k] = macro[k]["value"]
+        for k in ("vix", "10y_treasury", "2y_treasury", "10y_2y_spread", "fed_funds",
+                  "core_cpi_index", "unemployment"):
+            entry = macro.get(k)
+            if isinstance(entry, dict) and "value" in entry:
+                regime[k] = {"value": entry["value"], "date": entry.get("date"),
+                             "age_days": entry.get("age_days"), "stale": bool(entry.get("stale"))}
+                if entry.get("yoy_pct") is not None:
+                    regime[k]["yoy_pct"] = entry["yoy_pct"]
+                if entry.get("stale"):
+                    data_checks.append(
+                        f"{k} is stale: {entry['value']} as of {entry.get('date')} "
+                        f"({entry.get('age_days')} days before {date.today().isoformat()})")
     ratings = {}
     for tk, rep in reports.items():
         ratings.setdefault(str(rep.get("pm_rating")), []).append(tk)
@@ -474,12 +632,22 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
         s = win1[tk]
         ent["ann_vol_pct"] = round(float(s.std() * math.sqrt(TRADING_DAYS) * 100), 1)
         if bench1 is not None:
-            b1, b2 = _beta(s.dropna(), bench1), _beta(win2[tk].dropna(), bench2)
+            s2 = win2[tk].dropna()
+            b1 = _beta(s.dropna(), bench1)
+            b2 = _beta(s2, bench2) if len(s2) >= len(s.dropna()) + 40 else None
             ent["beta_1y"] = round(b1, 2) if b1 is not None else None
             ent["beta_2y"] = round(b2, 2) if b2 is not None else None
         ent["corr_to_book_1y"] = round(float(s.corr(port_ret)), 2)
         ent["avg_corr_to_holdings_1y"] = round(float(win1[list(w.index)].corrwith(s).mean()), 2)
         ent.update(_trend_stats(close[tk]))
+        if tk in close:
+            ent["atr_stop"] = _atr_stop(close[tk])
+        if (ent.get("type") or "").lower() != "etf":
+            earn = _earnings_info(tk, date.today())
+            if earn:
+                ent["earnings"] = earn
+                if earn.get("calendar_days") is not None and earn["calendar_days"] <= RISK_POLICY["earnings_warn_days"]:
+                    data_checks.append(f"{tk}: earnings {earn.get('date')} in {earn['calendar_days']} calendar days")
         # diversification benefit: add 3% funded from cash, and swap 3% out of top risk contributor
         x = s.fillna(0.0)
         for label, w_new in (("add3pct_from_cash", w.copy()), (f"swap3pct_from_{top_risk}", w.copy())):
@@ -511,6 +679,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                           "by_theme_pct": {k: round(v, 1) for k, v in by_theme.items()},
                           "by_bucket_pct": {k: round(v, 1) for k, v in by_bucket.items()}},
         "regime": regime,
+        "risk_policy": RISK_POLICY,
         "correlation_matrix": corr.to_dict(),
         "correlation_clusters": correlation_clusters(corr.drop(index=BENCH, columns=BENCH, errors="ignore"), corr_threshold),
         "correlation_threshold": corr_threshold,
@@ -543,8 +712,15 @@ Rules:
    kept or recycled into holdings. Use candidates' trend, vol, beta, correlation to the book and the
    diversification numbers (port_vol_change_pp_*). A candidate without an agent report can still be bought,
    but say its rating is missing and size it smaller / stage it; prefer diversified ETFs when evidence is thin.
-6. Prioritise execution (risk reduction before adds). Give stop / reassess levels from supplied technicals.
+6. Prioritise execution (risk reduction before adds). Give a numeric stop_or_reassess for every name you keep.
+   If you omit one, code fills the supplied atr_stop and warns. atr_stop is a close-to-close ATR proxy, not a hard stop.
 7. State what evidence would change your mind. Be concrete, numeric, honest about data gaps.
+8. `risk_policy` is enforced in code after your plan (it does not rewrite share counts). Stay inside it:
+   single-stock cap, a tighter cap when volatility is high or history is short, broad-index cap,
+   top-3 cap, minimum trade size, and the AI sleeve cap. The AI sleeve is ai_growth plus AAPL/MSFT/GOOG
+   plus spy_tech_share of SPY, because those megacaps are tagged quality and SPY is about one-third tech.
+   Flag earnings inside earnings_warn_days rather than adding into them. Regime values carry their dates;
+   a stale flag means the print is older than one session (or one release for monthly series).
 This is decision support, not financial advice."""
 
 ANALYST_ROLES = {
@@ -695,13 +871,16 @@ def call_llm(model: str, system: str, user: str, schema: dict, name: str, max_to
     raise RuntimeError(f"{label}: all LLM attempts failed: {last_err}")
 
 
-def run_debate(context: str, draft: dict, models: dict, rounds: int, max_tokens: int, effort: str | None) -> list[dict]:
+def run_debate(context: str, draft: dict, models: dict, rounds: int, max_tokens: int, effort: str | None,
+               anchor: str) -> list[dict]:
     transcript = []
     for rnd in range(1, rounds + 1):
-        for role in ("aggressive", "conservative", "neutral"):
+        order = speaking_order(rnd, anchor)
+        log(f"  risk round {rnd} speaking order: {' -> '.join(order)}")
+        for role in order:
             prior = "\n\n".join(
                 f"[Round {t['round']}] {t['role'].upper()} ({t['model']}):\n" + json.dumps(t["parsed"] or t["content"], indent=1)
-                for t in transcript) or "(you speak first)"
+                for t in transcript) or "(you speak first this round)"
             user = (context + "\n\n## Fund Manager DRAFT plan\n" + json.dumps(draft, indent=1)
                     + f"\n\n## Risk committee debate so far (round {rnd} of {rounds})\n" + prior
                     + "\n\n## Your task\n" + ANALYST_TASK)
@@ -714,27 +893,68 @@ def run_debate(context: str, draft: dict, models: dict, rounds: int, max_tokens:
 
 
 # --------------------------------------------------------------------------- guardrails
+def _info_for(tk: str, pos: dict, wl: dict) -> dict:
+    return pos.get(tk) or wl.get(tk) or {}
+
+
+def _beta_of(info: dict) -> tuple[float, str]:
+    for key in ("stress_beta", "beta_1y", "beta_spy"):
+        v = info.get(key)
+        if isinstance(v, (int, float)) and math.isfinite(v):
+            return float(v), key
+    return 1.0, "assumed 1.0 (no beta)"
+
+
+def _position_cap(info: dict, policy: dict) -> tuple[float, str]:
+    theme = info.get("theme")
+    kind = (info.get("type") or "").lower()
+    if theme == "core_index" or (kind == "etf" and info.get("ticker") in (None, BENCH)) or info.get("ticker") == BENCH:
+        return policy["broad_index_cap_pct"], "broad index"
+    obs = info.get("obs_1y") or info.get("history_bars") or 0
+    if obs and obs < policy["short_history_bars"]:
+        return policy["short_history_cap_pct"], f"history {obs} bars"
+    vol = info.get("ann_vol_pct")
+    if isinstance(vol, (int, float)) and vol > policy["high_vol_threshold_pct"]:
+        return policy["high_vol_cap_pct"], f"vol {vol}%"
+    return policy["single_stock_cap_pct"], "single name"
+
+
+def _stop_number(value) -> float | None:
+    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+        return float(value)
+    return None
+
+
 def validate_trades(decision: dict, stats: dict) -> dict:
     pos = {r["ticker"]: r for r in stats["positions"]}
     wl = {c["ticker"]: c for c in stats.get("watchlist", [])}
-    cash = stats["account"]["cash"]
-    total = stats["account"]["total_value"]
+    cash = float(stats["account"]["cash"])
+    total = float(stats["account"]["total_value"] or 0)
     pol = stats["cash_policy"]
+    policy = {**RISK_POLICY, **(stats.get("risk_policy") or {})}
     warnings, rows = [], []
     new_qty = {tk: r["quantity"] for tk, r in pos.items()}
+    prices = {}
     seen = set()
+    min_trade = float(policy["min_trade_usd"])
     for t in decision.get("trades", []):
         tk = t.get("ticker")
-        if tk in pos and pos[tk]["price"]:
-            px = pos[tk]["price"]
-        elif tk in wl and wl[tk].get("price"):
-            px = wl[tk]["price"]
+        info = _info_for(tk, pos, wl)
+        if info.get("price"):
+            px = float(info["price"])
         else:
             px = float(t.get("est_price") or 0)
             if tk not in pos:
                 warnings.append(f"{tk}: not in book or watchlist - priced at model estimate ${px:,.2f}")
+        prices[tk] = px
         sh = int(t.get("shares") or 0)
         act = (t.get("action") or "HOLD").upper()
+        if tk in seen:
+            warnings.append(f"{tk}: duplicate trade ignored (first row kept)")
+            continue
+        if act == "HOLD" and sh:
+            warnings.append(f"{tk}: HOLD with {sh} shares; treated as no trade")
+            sh = 0
         if act == "SELL":
             held = new_qty.get(tk, 0)
             if sh > held:
@@ -745,6 +965,15 @@ def validate_trades(decision: dict, stats: dict) -> dict:
         elif act == "BUY":
             new_qty[tk] = new_qty.get(tk, 0) + sh
             cash -= sh * px
+        if act in ("BUY", "SELL") and sh > 0 and sh * px < min_trade:
+            warnings.append(f"{tk}: {act} {sh} is ${sh * px:,.0f}, below the ${min_trade:,.0f} minimum trade")
+        decision_name = (t.get("decision") or "").lower()
+        if decision_name in ("trim", "exit") and act != "SELL":
+            warnings.append(f"{tk}: decision {decision_name} but action is {act}")
+        if decision_name in ("add", "new_position") and act != "BUY":
+            warnings.append(f"{tk}: decision {decision_name} but action is {act}")
+        if (t.get("order_type") or "").lower() == "staged" and act in ("BUY", "SELL") and sh:
+            warnings.append(f"{tk}: staged order is counted as filled in the post-trade cash and risk figures")
         seen.add(tk)
         rows.append({**t, "shares": sh, "value_usd": round(sh * px, 2), "calc_price": round(px, 2)})
     missing = [tk for tk in pos if tk not in seen]
@@ -759,15 +988,87 @@ def validate_trades(decision: dict, stats: dict) -> dict:
             warnings.append(f"target cash {tgt}% is outside the policy band {pol['min_pct']}-{pol['max_pct']}%")
         if abs(cash_pct - tgt) > 3:
             warnings.append(f"post-trade cash {cash_pct:.1f}% differs from stated target {tgt}% by more than 3 points")
+
+    levels = {}
+    for lv in decision.get("levels") or []:
+        if isinstance(lv, dict) and lv.get("ticker") and lv["ticker"] not in levels:
+            levels[lv["ticker"]] = lv
     after = []
+    beta_w = 0.0
+    ai = 0.0
+    assumed = []
     for tk, q in new_qty.items():
-        px = pos[tk]["price"] if tk in pos else (wl.get(tk, {}).get("price") or 0)
-        after.append({"ticker": tk, "shares_after": q, "value_after": round(q * (px or 0), 2),
-                      "weight_after_pct": round(q * (px or 0) / total * 100, 1), "is_new": tk not in pos})
+        info = _info_for(tk, pos, wl)
+        px = prices.get(tk)
+        if px is None:
+            px = float(info.get("price") or 0)
+        value = q * (px or 0)
+        weight = value / total * 100 if total else 0
+        beta, beta_src = _beta_of(info)
+        if beta_src.startswith("assumed") and q:
+            assumed.append(tk)
+        beta_w += (value / total) * beta if total else 0
+        cap, why = _position_cap({**info, "ticker": tk}, policy)
+        if weight > cap + 0.05 and q:
+            warnings.append(f"{tk}: post-trade weight {weight:.1f}% exceeds the {cap:.0f}% cap ({why})")
+        theme = info.get("theme")
+        if theme == "ai_growth" or tk in AI_MEGACAP:
+            ai += weight
+        elif tk == BENCH:
+            ai += weight * float(policy["spy_tech_share"])
+        downside, downside_src = None, None
+        if q:
+            stop = _stop_number((levels.get(tk) or {}).get("stop_or_reassess"))
+            if stop is None:
+                fallback = _stop_number(info.get("atr_stop"))
+                if fallback is not None:
+                    downside, downside_src = fallback, "atr_fallback"
+                    warnings.append(
+                        f"{tk}: no stop/downside in the plan; ATR fallback ${fallback:,.2f} "
+                        "(2.5x 14-day close-to-close ATR, and not above a break of the 20-day low)")
+                else:
+                    warnings.append(f"{tk}: no stop/downside and no ATR fallback (not enough history)")
+            else:
+                downside, downside_src = stop, "plan"
+            earn = info.get("earnings") or {}
+            days = earn.get("calendar_days")
+            if days is not None and days <= policy["earnings_warn_days"]:
+                warnings.append(
+                    f"{tk}: earnings {earn.get('date')} in {days} calendar days "
+                    f"(warning window is {policy['earnings_warn_days']} days)")
+        after.append({"ticker": tk, "shares_after": q, "value_after": round(value, 2),
+                      "weight_after_pct": round(weight, 1), "is_new": tk not in pos,
+                      "beta": round(beta, 2), "beta_source": beta_src,
+                      "downside": downside, "downside_source": downside_src})
+    if assumed:
+        warnings.append("post-trade beta uses 1.0 for: " + ", ".join(assumed))
+    if ai > policy["ai_sleeve_cap_pct"] + 0.05:
+        warnings.append(
+            f"AI look-through {ai:.1f}% exceeds the {policy['ai_sleeve_cap_pct']:.0f}% sleeve cap "
+            f"(ai_growth + AAPL/MSFT/GOOG + {float(policy['spy_tech_share']):.0%} of SPY)")
+    ranked = sorted((a for a in after if a["shares_after"]), key=lambda a: -a["weight_after_pct"])
+    top3 = sum(a["weight_after_pct"] for a in ranked[:3])
+    if top3 > policy["top3_cap_pct"] + 0.05:
+        names = ", ".join(a["ticker"] for a in ranked[:3])
+        warnings.append(f"top 3 ({names}) are {top3:.1f}% of NAV, above the {policy['top3_cap_pct']:.0f}% cap")
+    shocks = {}
+    for shock in (-0.05, -0.10, -0.20):
+        pnl = 0.0
+        for a in after:
+            if not a["shares_after"]:
+                continue
+            pnl += a["value_after"] * a["beta"] * shock
+        shocks[f"SPY_{int(shock * 100)}pct_beta_scaled"] = {
+            "pnl_usd": round(pnl, 0), "pnl_pct_of_account": round(pnl / total * 100, 1) if total else None}
     after.append({"ticker": "cash", "shares_after": None, "value_after": round(cash, 2),
-                  "weight_after_pct": round(cash_pct, 1), "is_new": False})
+                  "weight_after_pct": round(cash_pct, 1), "is_new": False,
+                  "beta": 0.0, "beta_source": "cash", "downside": None, "downside_source": None})
+    post_trade_risk = {"beta_spy": round(beta_w, 2), "ai_lookthrough_pct": round(ai, 1),
+                       "top3_pct": round(top3, 1), "stress": shocks,
+                       "note": "Beta and stress are share-weighted from each name's stress beta (else 1y beta, else 1.0). Cash beta is 0. Not a covariance recomputation."}
     return {"trades": rows, "post_trade": after, "ending_cash": round(cash, 2),
-            "ending_cash_pct": round(cash_pct, 1), "warnings": warnings}
+            "ending_cash_pct": round(cash_pct, 1), "warnings": warnings,
+            "post_trade_risk": post_trade_risk}
 
 
 def diff_plans(draft: dict | None, final: dict | None) -> list[dict]:
@@ -812,6 +1113,18 @@ def render_plan_trades(L, plan, check, targets):
     L.append(f"\nPriority order: {' -> '.join(plan.get('priority_order', []))}\n")
     L.append("### Post-trade check (computed by the add-on, not the model)")
     L.append(f"Ending cash: **{fmt_money(check['ending_cash'])} ({check['ending_cash_pct']}%)**")
+    risk = check.get("post_trade_risk") or {}
+    if risk:
+        L.append(f"Post-trade beta (code): **{risk.get('beta_spy')}** | AI look-through **{risk.get('ai_lookthrough_pct')}%** "
+                 f"(ai_growth + AAPL/MSFT/GOOG + {int(SPY_TECH_SHARE * 100)}% of SPY) | top 3 **{risk.get('top3_pct')}%**")
+        L.append("Post-trade stress (code, beta-scaled): " + "; ".join(
+            f"{k}: {fmt_money(v['pnl_usd'])} ({v['pnl_pct_of_account']}%)" for k, v in (risk.get("stress") or {}).items()))
+        if risk.get("note"):
+            L.append(risk["note"])
+    stops = [a for a in check.get("post_trade", []) if a.get("downside")]
+    if stops:
+        L.append("Downside levels: " + "; ".join(
+            f"{a['ticker']} ${a['downside']} ({a.get('downside_source')})" for a in stops))
     if check["warnings"]:
         L.append("\nWarnings:\n" + "\n".join(f"- {w}" for w in check["warnings"]))
     tw = (targets or {}).get("weights_pct", {})
@@ -832,6 +1145,8 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
     L.append(f"_Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC | fund manager `{models['fm']}` | "
              f"risk team: aggressive `{models['aggressive']}`, conservative `{models['conservative']}`, neutral "
              f"`{models['neutral']}` | prices as of {stats['as_of_prices']} | decision support, not financial advice._\n")
+    if models.get("note"):
+        L.append(f"_{models['note']}_\n")
     if not plan:
         L.append("_LLM step skipped (--no-llm). Quantitative snapshot only._\n")
     else:
@@ -954,7 +1269,14 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
              + ". Buckets: " + ", ".join(f"{k} {v}%" for k, v in c["by_bucket_pct"].items()))
     L.append(f"\n**Correlation clusters (stocks linked by pairwise corr >= {stats['correlation_threshold']}, SPY excluded):** " + (
         "; ".join(f"{', '.join(g['tickers'])} (avg {g['avg_pairwise_corr']})" for g in stats["correlation_clusters"]) or "none"))
-    L.append("\n**Market regime:** " + ", ".join(f"{k} {v}" for k, v in stats["regime"].items() if k != "agent_ratings"))
+    def _fmt_regime(k, v):
+        if isinstance(v, dict) and "value" in v:
+            flag = " STALE" if v.get("stale") else ""
+            yoy = f", YoY {v['yoy_pct']}%" if v.get("yoy_pct") is not None else ""
+            return f"{k} {v['value']} ({v.get('date')}, age {v.get('age_days')}d{yoy}{flag})"
+        return f"{k} {v}"
+    L.append("\n**Market regime:** " + ", ".join(
+        _fmt_regime(k, v) for k, v in stats["regime"].items() if k != "agent_ratings"))
     L.append("Agent ratings: " + "; ".join(f"{k}: {', '.join(v)}" for k, v in stats["regime"].get("agent_ratings", {}).items()))
     if stats.get("data_checks"):
         L.append("\n**Data checks:**\n" + "\n".join(f"- {x}" for x in stats["data_checks"]))
@@ -986,6 +1308,8 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
             if "value" in v:
                 extra = f", 1y ago {v['value_1y_ago']}" if "value_1y_ago" in v else ""
                 extra += f", YoY {v['yoy_pct']}%" if "yoy_pct" in v else ""
+                extra += f", age {v['age_days']}d" if "age_days" in v else ""
+                extra += " STALE" if v.get("stale") else ""
                 L.append(f"- {k}: {v['value']} ({v['date']}{extra})")
     L.append("\n## Appendix B - Source agent reports")
     for tk, r in reports.items():
@@ -1017,8 +1341,12 @@ def main() -> int:
     ap.add_argument("--since", default=None, help="only use reports generated on/after YYYY-MM-DD (UTC)")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="fund manager model (draft + final)")
     ap.add_argument("--aggressive-model", default=os.getenv("FM_AGGRESSIVE_MODEL", DEFAULT_MODEL))
-    ap.add_argument("--neutral-model", default=os.getenv("FM_NEUTRAL_MODEL", DEFAULT_MODEL))
-    ap.add_argument("--conservative-model", default=os.getenv("FM_CONSERVATIVE_MODEL", "anthropic/claude-opus-5.5"))
+    ap.add_argument("--neutral-model", default=os.getenv("FM_NEUTRAL_MODEL", QUICK_MODEL),
+                    help="must differ from the fund manager; default is the Luna quick model")
+    ap.add_argument("--conservative-model", default=os.getenv("FM_CONSERVATIVE_MODEL", QUICK_MODEL),
+                    help="default is Luna. Opus is not the default (cost); it needs --allow-opus")
+    ap.add_argument("--allow-opus", action="store_true",
+                    help="permit an Opus model if one was passed explicitly")
     ap.add_argument("--risk-rounds", type=int, default=1, help="risk committee rounds (0 = no debate)")
     ap.add_argument("--reasoning-effort", default=os.getenv("FUND_MANAGER_REASONING_EFFORT", "high"),
                     help="fund manager effort: low|medium|high|none")
@@ -1060,7 +1388,7 @@ def main() -> int:
     reports = {tk: parse_report(tk, found[tk], args.include_risk, args.max_report_chars) for tk in tickers + wl_tk if tk in found}
 
     log("downloading ~2y daily prices from yfinance ...")
-    close = fetch_prices(tickers + wl_tk)
+    close = fetch_prices_with_regime(tickers + wl_tk)
     quotes = live_quotes(tickers + wl_tk, close)
     meta = ticker_meta(tickers)
     macro = None
@@ -1074,15 +1402,28 @@ def main() -> int:
     for msg in stats["data_checks"]:
         log(f"  data check: {msg}")
 
-    out_dir = Path(args.out_dir) / args.date
+    run_id = datetime.now().strftime("%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    out_dir = Path(args.out_dir) / args.date / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     pre = "snapshot_" if args.no_llm else ""
     context = build_context(book, targets, stats, reports, macro, args.date)
     (out_dir / f"{pre}prompt.md").write_text(FM_SYSTEM + "\n\n" + context, encoding="utf-8")
     (out_dir / f"{pre}portfolio_stats.json").write_text(json.dumps(stats, indent=2, default=str), encoding="utf-8")
 
+    args.model = _without_opus(args.model, args.allow_opus, "fund manager")
+    args.aggressive_model = _without_opus(args.aggressive_model, args.allow_opus, "aggressive")
+    args.conservative_model = _without_opus(args.conservative_model, args.allow_opus, "conservative")
+    args.neutral_model = _without_opus(args.neutral_model, args.allow_opus, "neutral")
+    if args.neutral_model == args.model:
+        replacement = QUICK_MODEL if args.model != QUICK_MODEL else DEFAULT_MODEL
+        if replacement == args.model:
+            replacement = QUICK_MODEL
+        log(f"neutral model {args.neutral_model} matches the fund manager; using {replacement} instead")
+        args.neutral_model = replacement
     models = {"fm": args.model, "aggressive": args.aggressive_model, "conservative": args.conservative_model,
-              "neutral": args.neutral_model}
+              "neutral": args.neutral_model,
+              "note": "Conservative and neutral default to openai/gpt-6-luna (the quick model already used "
+                      "for per-stock runs). Opus is not a default. Neutral is kept different from the fund manager."}
     eff = lambda e: None if e == "none" else e  # noqa: E731
     calls, draft, debate, final, check_d, check_f = [], None, [], None, None, None
     if not args.no_llm:
@@ -1098,7 +1439,7 @@ def main() -> int:
         if draft and args.risk_rounds > 0:
             log(f"[2/3] risk committee debate, {args.risk_rounds} round(s) ...")
             debate = run_debate(context, {**draft, "_post_trade_check": check_d}, models, args.risk_rounds,
-                                args.analyst_max_tokens, eff(args.analyst_effort))
+                                args.analyst_max_tokens, eff(args.analyst_effort), args.date)
             calls += [{"label": f"risk/{t['role']} r{t['round']}", "model_req": t["model"], "mode": t["mode"],
                        "seconds": t["seconds"], "usage": t["usage"]} for t in debate]
             log("[3/3] fund manager FINAL ...")
@@ -1122,7 +1463,8 @@ def main() -> int:
     md = render_markdown(args.date, models, stats, reports, macro, calls, draft, debate, final, check_d, check_f, targets)
     stem = "portfolio_snapshot" if args.no_llm else "portfolio_report"
     (out_dir / f"{stem}.md").write_text(md, encoding="utf-8")
-    payload = {"date": args.date, "models": models, "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    payload = {"date": args.date, "run_id": run_id, "models": models,
+               "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                "reports": {tk: {k: v for k, v in r.items() if k not in ("pm_decision", "research_manager", "risk_debate")}
                            for tk, r in reports.items()},
                "stats": stats, "macro": macro, "draft": draft, "draft_check": check_d, "debate": debate,
@@ -1130,6 +1472,10 @@ def main() -> int:
                "llm_calls": [{k: v for k, v in c.items() if k not in ("content", "parsed")} for c in calls],
                "raw_text_fallbacks": [c["content"] for c in calls if c.get("mode") == "text"]}
     (out_dir / f"{stem}.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    latest = {"date": args.date, "run_id": run_id, "path": f"{args.date}/{run_id}",
+              "kind": "snapshot" if args.no_llm else "report",
+              "generated_utc": payload["generated_utc"]}
+    (Path(args.out_dir) / "latest.json").write_text(json.dumps(latest, indent=2), encoding="utf-8")
 
     print("\n" + "=" * 70)
     print(f"FUND MANAGER - {args.date}   account ${acct['total_value']:,.0f}")
@@ -1144,6 +1490,9 @@ def main() -> int:
                 print(f"  {t['action']:4s} {t['shares']:>4d} {t['ticker']:6s} ~${t['value_usd']:>9,.0f}  ({t.get('decision', '')})")
         for d in diff_plans(draft, final):
             print(f"  changed vs draft: {d['ticker']}: {d['draft']} -> {d['final']}")
+        risk = chk.get("post_trade_risk") or {}
+        if risk:
+            print(f"  post-trade beta {risk.get('beta_spy')} | AI look-through {risk.get('ai_lookthrough_pct')}% | top 3 {risk.get('top3_pct')}%")
         for w in chk["warnings"]:
             print(f"  ! {w}")
     if calls:

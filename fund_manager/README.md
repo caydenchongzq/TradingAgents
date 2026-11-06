@@ -15,7 +15,7 @@ Runs inside the existing `tradingagents` Docker image (reuses yfinance, pandas, 
    (SPY trend, realized vol, breadth, VIX/rates from FRED, agent-rating mix), watchlist candidate stats
    (trend, vol, beta, correlation to the book, portfolio-vol change if added / swapped in).
 4. **Fund Manager DRAFT** (Sol) - keep / trim / exit / add for every holding, swaps into candidates, dynamic cash target.
-5. **Risk committee** debates the draft: Aggressive (Sol) -> Conservative (Opus 5.5) -> Neutral (Sol), `-RiskRounds` rounds.
+5. **Risk committee** debates the draft. Speaking order rotates by the decision date and the round, so neutral is not always last. Aggressive stays on Sol. Conservative and neutral default to `openai/gpt-6-luna`, the quick model already used for per-stock runs, and neutral is kept different from the fund manager. Opus is not a default (it was the expensive seat, about $0.39 of a $1.20 committee). `-AllowOpus` is required to pass an Opus model through.
 6. **Fund Manager FINAL** (Sol) - reads the debate, issues the final plan, lists changes vs draft and how each debate point was treated.
 7. Guardrails recompute cash and post-trade weights, cap over-sells, flag cash outside the band or off-target.
 
@@ -34,7 +34,7 @@ powershell -ExecutionPolicy Bypass -File .\addons\fund_manager\run_portfolio.ps1
 powershell -ExecutionPolicy Bypass -File .\addons\fund_manager\run_portfolio.ps1 -IncludeWatchlist     # agent reports for candidates first
 powershell -ExecutionPolicy Bypass -File .\addons\fund_manager\run_portfolio.ps1 -NoLLM                # free quant snapshot
 ```
-Other options: `-ConservativeModel anthropic/claude-opus-5.5`, `-AggressiveModel`, `-NeutralModel`, `-Model` (fund manager),
+Other options: `-ConservativeModel openai/gpt-6-luna` (default; Opus is refused unless `-AllowOpus`), `-NeutralModel openai/gpt-6-luna`, `-AggressiveModel`, `-Model` (fund manager),
 `-ReasoningEffort high` (manager), `-AnalystEffort medium`, `-Tickers NVDA,TSLA` (limit native runs), `-NoWatchlist`,
 `-IncludeRisk` (feed per-stock risk notes), `-NoMacro`, `-Since YYYY-MM-DD`.
 
@@ -44,7 +44,11 @@ Other options: `-ConservativeModel anthropic/claude-opus-5.5`, `-AggressiveModel
 - `themes.json` (this folder) - theme/bucket tags for concentration.
 - Prompts/schemas: `FM_SYSTEM`, `ANALYST_ROLES`, `ANALYST_TASK`, `*_SCHEMA` in `fund_manager.py`.
 
-## Outputs: `data\fund_manager\<date>\`
+## Session date and prices
+The run script sets the container timezone to `EST5EDT,M3.2.0,M11.1.0` (America/New_York, without tzdata) and takes the analysis date from that clock, so TradingAgents does not treat a live run as a backtest. Before anything else, `preflight.py` checks that each ticker's latest completed session bar has a real close, deletes a cache file that does not, and aborts if a refetch still has no close. `-RunAgents` also refuses to start while the US cash session is open, unless `-AllowIntraday`.
+
+## Outputs: `data\fund_manager\<date>\<HHMMSS>_<id>\`
+A `latest.json` pointer sits next to the date folders. Re-runs no longer overwrite the previous plan. `-NoLLM` still uses the `snapshot_` / `portfolio_snapshot` names inside its own folder.
 - `portfolio_report.md` - cash decision, final plan, changes vs draft, debate, per-stock agent views side by side, quant appendix, LLM cost table
 - `portfolio_report.json` - draft, debate, final, guardrail checks, stats, usage
 - `portfolio_stats.json`, `prompt.md` - exact inputs, for auditing / refining
