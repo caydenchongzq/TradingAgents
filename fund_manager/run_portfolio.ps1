@@ -22,6 +22,8 @@
   .\addons\fund_manager\run_portfolio.ps1 -RunAgents             # rerun the holdings first (after the NY close)
   .\addons\fund_manager\run_portfolio.ps1 -RunAgents -IncludeWatchlist
   .\addons\fund_manager\run_portfolio.ps1 -NoLLM                 # free quant snapshot only
+  .\addons\fund_manager\run_portfolio.ps1 -Tiered             # agents on holdings + top 8 screened candidates
+  .\addons\fund_manager\run_portfolio.ps1 -Tiered -NoLLM      # screen and print that set; no agent calls
 #>
 [CmdletBinding()]
 param(
@@ -45,6 +47,8 @@ param(
   [switch]$NoLLM,
   [switch]$NoMacro,
   [switch]$AllowIntraday,                  # live agent run while the US cash session is open
+  [switch]$Tiered,                         # agents on holdings + top screened candidates, not the whole watchlist
+  [int]$TierN = 8,                         # how many screened candidates -Tiered adds
   [string]$Since = ""                      # only use reports generated on/after YYYY-MM-DD (UTC)
 )
 
@@ -106,6 +110,28 @@ if ($pfCode -ne 0 -or $status -ne "ok") {
 }
 Write-Host "Analysis date $AnalysisDate (New York). Container TZ is $NyTz." -ForegroundColor Green
 
+$tierCandidates = @()
+if ($Tiered) {
+  $ScoutDir = Join-Path $ProjectDir "addons\theme_scout"
+  Write-Host "Theme screen (top $TierN candidates, no model call) ..." -ForegroundColor Cyan
+  $scoutArgs = @("/home/appuser/theme_scout/theme_scout.py", "--screen", "--date", $AnalysisDate,
+                 "--tier-n", "$TierN", "--themes", "/home/appuser/addon/themes.json")
+  $scoutRaw = & docker compose run --rm -T -e "TZ=$NyTz" --entrypoint python `
+    -v "${ScoutDir}:/home/appuser/theme_scout:ro" -v "${AddonDir}:/home/appuser/addon:ro" `
+    tradingagents @scoutArgs 2>&1
+  $scoutCode = $LASTEXITCODE
+  $scoutRaw | ForEach-Object { Write-Host $_ }
+  $scoutText = ($scoutRaw | Out-String)
+  if ($scoutText -match 'TIER_CANDIDATES=([A-Z0-9.\-,]*)') {
+    $tierCandidates = @($Matches[1].Split(",") | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
+  }
+  if ($scoutCode -ne 0) {
+    Write-Error "Theme screen failed (exit=$scoutCode). No agent run was started."
+    exit $scoutCode
+  }
+  Write-Host ("Tier candidates: " + ($(if ($tierCandidates.Count) { $tierCandidates -join ", " } else { "(none)" }))) -ForegroundColor Green
+}
+
 function Invoke-NativeRun([string[]]$list, [string]$kind) {
   # Uses add-on wrapper so news_data = yfinance,alpha_vantage without editing project source.
   $failed = @()
@@ -124,19 +150,26 @@ function Invoke-NativeRun([string[]]$list, [string]$kind) {
 }
 
 $nativeFailed = @()
-if ($RunAgents) {
+if ($Tiered -and $IncludeWatchlist) {
+  Write-Warning "-Tiered keeps the agent set to holdings plus the screened top $TierN. -IncludeWatchlist does not add the rest of the watchlist."
+}
+if ($Tiered -and -not $NoLLM) {
+  $list = @($(Get-BookTickers) + $tierCandidates | Select-Object -Unique)
+  if ($only.Count) { $list = @($list | Where-Object { $only -contains $_ }) }
+  $nativeFailed += @(Invoke-NativeRun $list "tier")
+} elseif ($RunAgents) {
   $list = @(Get-BookTickers)
   if ($only.Count) { $list = @($list | Where-Object { $only -contains $_ }) }
   $nativeFailed += @(Invoke-NativeRun $list "holding")
 }
-if ($IncludeWatchlist) {
+if ($IncludeWatchlist -and -not $Tiered) {
   $held = @(Get-BookTickers)
   $cands = @(Get-WatchTickers | Where-Object { $held -notcontains $_ })
   if ($only.Count) { $cands = @($cands | Where-Object { $only -contains $_ }) }
   $nativeFailed += @(Invoke-NativeRun $cands "candidate")
 }
 # After a full holdings rerun, only use this session's reports. Partial reruns keep older reports for the rest.
-if ($RunAgents -and -not $Tickers -and -not $Since) { $Since = $AnalysisDate }
+if ((($RunAgents) -or ($Tiered -and -not $NoLLM)) -and -not $Tickers -and -not $Since) { $Since = $AnalysisDate }
 
 $fmArgs = @("/home/appuser/addon/fund_manager.py", "--date", $AnalysisDate,
             "--model", $Model, "--aggressive-model", $AggressiveModel, "--neutral-model", $NeutralModel,
