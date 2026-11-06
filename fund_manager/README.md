@@ -15,7 +15,7 @@ Runs inside the existing `tradingagents` Docker image (reuses yfinance, pandas, 
    (SPY trend, realized vol, breadth, VIX/rates from FRED, agent-rating mix), watchlist candidate stats
    (trend, vol, beta, correlation to the book, portfolio-vol change if added / swapped in).
 4. **Fund Manager DRAFT** (Sol) - keep / trim / exit / add for every holding, swaps into candidates, dynamic cash target.
-5. **Risk committee** debates the draft. Speaking order rotates by the decision date and the round, so neutral is not always last. Aggressive stays on Sol. Conservative and neutral default to `openai/gpt-6-luna`, the quick model already used for per-stock runs, and neutral is kept different from the fund manager. Opus is not a default (it was the expensive seat, about $0.39 of a $1.20 committee). `-AllowOpus` is required to pass an Opus model through.
+5. **Risk committee** debates the draft. Speaking order rotates by the decision date and the round, so neutral is not always last. Aggressive stays on Sol. Conservative is `anthropic/claude-opus-5.5`. Neutral is `openai/gpt-6-luna` and is kept different from the fund manager. `-AllowOpus` only lets an Opus model onto the fund manager, aggressive, or neutral seat.
 6. **Fund Manager FINAL** (Sol) - reads the debate, issues the final plan, lists changes vs draft and how each debate point was treated.
 7. Guardrails recompute cash and post-trade weights, cap over-sells, flag cash outside the band or off-target.
 
@@ -34,14 +34,19 @@ powershell -ExecutionPolicy Bypass -File .\addons\fund_manager\run_portfolio.ps1
 powershell -ExecutionPolicy Bypass -File .\addons\fund_manager\run_portfolio.ps1 -IncludeWatchlist     # agent reports for candidates first
 powershell -ExecutionPolicy Bypass -File .\addons\fund_manager\run_portfolio.ps1 -NoLLM                # free quant snapshot
 ```
-Other options: `-ConservativeModel openai/gpt-6-luna` (default; Opus is refused unless `-AllowOpus`), `-NeutralModel openai/gpt-6-luna`, `-AggressiveModel`, `-Model` (fund manager),
+Other options: `-ConservativeModel anthropic/claude-opus-5.5` (the default), `-NeutralModel openai/gpt-6-luna`, `-AggressiveModel`, `-Model` (fund manager), `-AllowOpus` (Opus on a seat other than conservative),
 `-ReasoningEffort high` (manager), `-AnalystEffort medium`, `-Tickers NVDA,TSLA` (limit native runs), `-NoWatchlist`,
 `-IncludeRisk` (feed per-stock risk notes), `-NoMacro`, `-Since YYYY-MM-DD`.
 
 ## Files
-- `data\targets.json` - guidance weights + cash policy. `data\watchlist.json` - candidates: a list of
+- `data\targets.json` - guidance weights, cash policy, and `ai_sleeve`. `data\watchlist.json` - candidates: a list of
   `{"ticker","sector","type","theme","note"}` (only ticker required) or plain tickers.
-- `themes.json` (this folder) - theme/bucket tags for concentration.
+- `themes.json` (this folder) - theme/bucket tags for concentration. Names in `ai_growth` count fully in the AI sleeve unless `ai_sleeve.ticker_weight` sets another fraction.
+
+## AI sleeve
+`data\targets.json` -> `ai_sleeve`. `theme_weight` is the fraction of a theme that counts (ai_growth is 1). `ticker_weight` overrides that, and 0 excludes the ticker. Unlisted tickers keep the built-in defaults (MSFT, GOOG, and GOOGL at 1, SPY at 0.33, AAPL at 0). The add-on template is `addons\fund_manager\targets.json`.
+
+AAPL is 0 because its Yahoo adjusted-close correlation to SMH, through the 2026-11-05 session, was about 0.05 over 252 sessions and -0.12 over 60 sessions. MSFT was 0.13 / 0.28 and GOOG was 0.28 / 0.16 on the same windows. The rule was to drop AAPL when that correlation is clearly below MSFT and GOOG (the example line was 0.5). On 5 Nov 2026, AAPL was -1.53% against SMH -11.21% and NVDA -9.26%.
 - Prompts/schemas: `FM_SYSTEM`, `ANALYST_ROLES`, `ANALYST_TASK`, `*_SCHEMA` in `fund_manager.py`.
 
 ## Session date and prices

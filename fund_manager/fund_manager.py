@@ -31,19 +31,22 @@ ADDON_DIR = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.getenv("FM_DATA_ROOT", "/home/appuser/.tradingagents"))
 DEFAULT_MODEL = os.getenv("FUND_MANAGER_MODEL", "openai/gpt-6.1-sol")
 # Quick model already used for per-stock runs (cli prefs: openai/gpt-6-luna).
-# The conservative seat used to default to anthropic/claude-opus-5.5 (~$0.39 of a
-# ~$1.20 committee). Opus is not a default anywhere in this add-on: it is the
-# expensive seat and easy to leave on. Luna takes that seat, and also the neutral
-# seat so the neutral voice is not the fund manager's own Sol model.
+# Neutral uses it so that voice is not the fund manager's own Sol model.
+# Conservative is Opus on purpose: Cayden wants that seat in the risk debate.
 QUICK_MODEL = "openai/gpt-6-luna"
+CONSERVATIVE_MODEL = "anthropic/claude-opus-5.5"
 OPENROUTER_BASE = os.getenv("FUND_MANAGER_BASE_URL", "https://openrouter.ai/api/v1")
 BENCH = "SPY"
 TRADING_DAYS = 252
 REGIME_SYMBOLS = ["QQQ", "SMH", "IWM", "^VIX", "^VIX3M"]
-# GOOG/MSFT/AAPL sit in megacap_quality, not ai_growth. Count them, plus this
-# fraction of SPY (mega-cap tech share of the index), in the AI sleeve.
-AI_MEGACAP = {"AAPL", "MSFT", "GOOG", "GOOGL"}
-SPY_TECH_SHARE = 0.33
+# Fallback only. A live run reads data/targets.json "ai_sleeve" and merges it
+# over this table. Ticker weights override theme weights. 0 excludes a name.
+# AAPL is 0 after the 2026-11-05 Yahoo check (corr to SMH about 0.05 over 1y
+# and -0.12 over 60 sessions, below MSFT and GOOG and below 0.5).
+DEFAULT_AI_SLEEVE = {
+    "theme_weight": {"ai_growth": 1.0},
+    "ticker_weight": {"AAPL": 0.0, "MSFT": 1.0, "GOOG": 1.0, "GOOGL": 1.0, "SPY": 0.33},
+}
 FRED_LOOKBACK_DAYS = 800
 FRED_MONTHLY = {"fed_funds", "core_cpi_index", "unemployment"}
 RISK_POLICY = {
@@ -54,8 +57,7 @@ RISK_POLICY = {
     "short_history_bars": 252,
     "broad_index_cap_pct": 35.0,
     "ai_sleeve_cap_pct": 35.0,
-    "spy_tech_share": SPY_TECH_SHARE,
-    "ai_megacap": sorted(AI_MEGACAP),
+    "ai_sleeve": DEFAULT_AI_SLEEVE,
     "top3_cap_pct": 50.0,
     "min_trade_usd": 500.0,
     "earnings_warn_days": 7,
@@ -433,11 +435,68 @@ def speaking_order(rnd: int, anchor: str) -> tuple[str, ...]:
     return roles[start:] + roles[:start]
 
 
+def resolve_ai_sleeve(targets: dict | None) -> dict:
+    """Merge targets.json ai_sleeve over the defaults. Listed tickers win over themes."""
+    raw = {}
+    if isinstance(targets, dict) and isinstance(targets.get("ai_sleeve"), dict):
+        raw = targets["ai_sleeve"]
+    theme = {str(k): float(v) for k, v in DEFAULT_AI_SLEEVE["theme_weight"].items()}
+    tick = {str(k).upper(): float(v) for k, v in DEFAULT_AI_SLEEVE["ticker_weight"].items()}
+    for k, v in (raw.get("theme_weight") or {}).items():
+        theme[str(k)] = float(v)
+    for k, v in (raw.get("ticker_weight") or {}).items():
+        tick[str(k).strip().upper()] = float(v)
+    out = {"theme_weight": theme, "ticker_weight": tick}
+    if raw.get("as_of"):
+        out["as_of"] = str(raw["as_of"])
+    return out
+
+
+def sleeve_fraction(ticker: str, theme: str | None, sleeve: dict | None) -> float:
+    """Share of this position's weight that counts in the AI look-through."""
+    table = sleeve or DEFAULT_AI_SLEEVE
+    tick = table.get("ticker_weight") or {}
+    if ticker in tick:
+        return float(tick[ticker])
+    themes = table.get("theme_weight") or {}
+    if theme and theme in themes:
+        return float(themes[theme])
+    return 0.0
+
+
+def sleeve_label(sleeve: dict | None) -> str:
+    table = sleeve or DEFAULT_AI_SLEEVE
+    bits = []
+    for name, weight in (table.get("theme_weight") or {}).items():
+        bits.append(name if float(weight) == 1 else f"{name} {float(weight):.0%}")
+    for ticker, weight in (table.get("ticker_weight") or {}).items():
+        if float(weight) == 0:
+            continue
+        bits.append(f"{ticker} {float(weight):.0%}")
+    excluded = [ticker for ticker, weight in (table.get("ticker_weight") or {}).items() if float(weight) == 0]
+    text = " + ".join(bits)
+    if excluded:
+        text += " (excluded: " + ", ".join(excluded) + ")"
+    return text
+
+
+def _policy_with_sleeve(targets: dict | None) -> dict:
+    sleeve = resolve_ai_sleeve(targets)
+    policy = {**RISK_POLICY, "ai_sleeve": sleeve}
+    spy = float((sleeve.get("ticker_weight") or {}).get(BENCH, 0.33))
+    policy["spy_tech_share"] = spy
+    policy["ai_megacap"] = sorted(
+        ticker for ticker, weight in (sleeve.get("ticker_weight") or {}).items()
+        if ticker != BENCH and float(weight) > 0)
+    return policy
+
+
 def _without_opus(model: str, allow_opus: bool, seat: str) -> str:
-    if allow_opus or "opus" not in (model or "").lower():
+    # The conservative seat is Opus by request. The gate stays on the other seats.
+    if seat == "conservative" or allow_opus or "opus" not in (model or "").lower():
         return model
-    log(f"{seat} model {model} is an Opus model, which this add-on does not use by default (cost). "
-        f"Using {QUICK_MODEL} instead. Pass --allow-opus to keep it.")
+    log(f"{seat} model {model} is an Opus model. This add-on keeps Opus on the conservative "
+        f"seat only. Using {QUICK_MODEL} instead. Pass --allow-opus to keep it on this seat.")
     return QUICK_MODEL
 
 
@@ -679,7 +738,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                           "by_theme_pct": {k: round(v, 1) for k, v in by_theme.items()},
                           "by_bucket_pct": {k: round(v, 1) for k, v in by_bucket.items()}},
         "regime": regime,
-        "risk_policy": RISK_POLICY,
+        "risk_policy": _policy_with_sleeve(targets),
         "correlation_matrix": corr.to_dict(),
         "correlation_clusters": correlation_clusters(corr.drop(index=BENCH, columns=BENCH, errors="ignore"), corr_threshold),
         "correlation_threshold": corr_threshold,
@@ -717,8 +776,9 @@ Rules:
 7. State what evidence would change your mind. Be concrete, numeric, honest about data gaps.
 8. `risk_policy` is enforced in code after your plan (it does not rewrite share counts). Stay inside it:
    single-stock cap, a tighter cap when volatility is high or history is short, broad-index cap,
-   top-3 cap, minimum trade size, and the AI sleeve cap. The AI sleeve is ai_growth plus AAPL/MSFT/GOOG
-   plus spy_tech_share of SPY, because those megacaps are tagged quality and SPY is about one-third tech.
+   top-3 cap, minimum trade size, and the AI sleeve cap. Sleeve membership is `risk_policy.ai_sleeve`
+   (from targets.json): theme_weight applies to a theme, and ticker_weight overrides it. A weight of 0
+   excludes that ticker even when its theme would count. Do not treat an excluded name as AI exposure.
    Flag earnings inside earnings_warn_days rather than adding into them. Regime values carry their dates;
    a stale flag means the print is older than one session (or one release for monthly series).
 This is decision support, not financial advice."""
@@ -1011,11 +1071,9 @@ def validate_trades(decision: dict, stats: dict) -> dict:
         cap, why = _position_cap({**info, "ticker": tk}, policy)
         if weight > cap + 0.05 and q:
             warnings.append(f"{tk}: post-trade weight {weight:.1f}% exceeds the {cap:.0f}% cap ({why})")
-        theme = info.get("theme")
-        if theme == "ai_growth" or tk in AI_MEGACAP:
-            ai += weight
-        elif tk == BENCH:
-            ai += weight * float(policy["spy_tech_share"])
+        frac = sleeve_fraction(tk, info.get("theme"), policy.get("ai_sleeve"))
+        if frac and q:
+            ai += weight * frac
         downside, downside_src = None, None
         if q:
             stop = _stop_number((levels.get(tk) or {}).get("stop_or_reassess"))
@@ -1045,7 +1103,7 @@ def validate_trades(decision: dict, stats: dict) -> dict:
     if ai > policy["ai_sleeve_cap_pct"] + 0.05:
         warnings.append(
             f"AI look-through {ai:.1f}% exceeds the {policy['ai_sleeve_cap_pct']:.0f}% sleeve cap "
-            f"(ai_growth + AAPL/MSFT/GOOG + {float(policy['spy_tech_share']):.0%} of SPY)")
+            f"({sleeve_label(policy.get('ai_sleeve'))})")
     ranked = sorted((a for a in after if a["shares_after"]), key=lambda a: -a["weight_after_pct"])
     top3 = sum(a["weight_after_pct"] for a in ranked[:3])
     if top3 > policy["top3_cap_pct"] + 0.05:
@@ -1099,7 +1157,7 @@ def _cell(x, n=220):
     return _clip(str(x) if x is not None else "", n)
 
 
-def render_plan_trades(L, plan, check, targets):
+def render_plan_trades(L, plan, check, targets, sleeve=None):
     order = {tk: i for i, tk in enumerate(plan.get("priority_order", []))}
     trades = sorted(check["trades"], key=lambda t: order.get(t["ticker"], 99))
     L.append("| # | Ticker | Decision | Action | Shares | Est. price | Value | Order | Limit | Timing | Agent rating | vs agent | Rationale |")
@@ -1116,7 +1174,7 @@ def render_plan_trades(L, plan, check, targets):
     risk = check.get("post_trade_risk") or {}
     if risk:
         L.append(f"Post-trade beta (code): **{risk.get('beta_spy')}** | AI look-through **{risk.get('ai_lookthrough_pct')}%** "
-                 f"(ai_growth + AAPL/MSFT/GOOG + {int(SPY_TECH_SHARE * 100)}% of SPY) | top 3 **{risk.get('top3_pct')}%**")
+                 f"({sleeve_label(sleeve)}) | top 3 **{risk.get('top3_pct')}%**")
         L.append("Post-trade stress (code, beta-scaled): " + "; ".join(
             f"{k}: {fmt_money(v['pnl_usd'])} ({v['pnl_pct_of_account']}%)" for k, v in (risk.get("stress") or {}).items()))
         if risk.get("note"):
@@ -1184,7 +1242,7 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
                 L += [f"- [{t['analyst']}] {t['point']} - **{t['accepted']}**: {t['response']}" for t in final["debate_takeaways"]]
             L.append("")
         L.append("## Final trades (whole shares)" if final else "## Trades (whole shares)")
-        render_plan_trades(L, plan, check, targets)
+        render_plan_trades(L, plan, check, targets, (stats.get("risk_policy") or {}).get("ai_sleeve"))
         if plan.get("swaps_considered"):
             L.append("\n## Swaps considered (holdings -> watchlist)")
             L.append("| From | To | Verdict | Reason |\n|---|---|---|---|")
@@ -1343,10 +1401,10 @@ def main() -> int:
     ap.add_argument("--aggressive-model", default=os.getenv("FM_AGGRESSIVE_MODEL", DEFAULT_MODEL))
     ap.add_argument("--neutral-model", default=os.getenv("FM_NEUTRAL_MODEL", QUICK_MODEL),
                     help="must differ from the fund manager; default is the Luna quick model")
-    ap.add_argument("--conservative-model", default=os.getenv("FM_CONSERVATIVE_MODEL", QUICK_MODEL),
-                    help="default is Luna. Opus is not the default (cost); it needs --allow-opus")
+    ap.add_argument("--conservative-model", default=os.getenv("FM_CONSERVATIVE_MODEL", CONSERVATIVE_MODEL),
+                    help="default is anthropic/claude-opus-5.5 and is always kept")
     ap.add_argument("--allow-opus", action="store_true",
-                    help="permit an Opus model if one was passed explicitly")
+                    help="also permit an Opus model on the fund manager, aggressive, or neutral seat")
     ap.add_argument("--risk-rounds", type=int, default=1, help="risk committee rounds (0 = no debate)")
     ap.add_argument("--reasoning-effort", default=os.getenv("FUND_MANAGER_REASONING_EFFORT", "high"),
                     help="fund manager effort: low|medium|high|none")
@@ -1422,8 +1480,9 @@ def main() -> int:
         args.neutral_model = replacement
     models = {"fm": args.model, "aggressive": args.aggressive_model, "conservative": args.conservative_model,
               "neutral": args.neutral_model,
-              "note": "Conservative and neutral default to openai/gpt-6-luna (the quick model already used "
-                      "for per-stock runs). Opus is not a default. Neutral is kept different from the fund manager."}
+              "note": "Conservative is anthropic/claude-opus-5.5. Neutral is openai/gpt-6-luna and is kept "
+                      "different from the fund manager. Opus is not used on the other seats unless --allow-opus. "
+                      "AI sleeve weights come from targets.json."}
     eff = lambda e: None if e == "none" else e  # noqa: E731
     calls, draft, debate, final, check_d, check_f = [], None, [], None, None, None
     if not args.no_llm:

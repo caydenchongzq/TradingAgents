@@ -4,7 +4,7 @@
     "core_index": ["SPY"],
     "core_value": ["BRK-B"],
     "megacap_quality": ["AAPL", "MSFT", "GOOG"],
-    "ai_growth": ["NVDA", "CRWV", "PLTR", "DRAM", "TSLA", "SPCX", "P", "NOK"]
+    "ai_growth": ["NVDA", "CRWV", "PLTR", "DRAM", "TSLA", "SPCX", "P", "NOK", "NBIS", "SKHY", "DISK", "NOW", "WDC", "SNDK", "NET", "ASML", "INTC", "AMD", "TSM", "ON"]
   },
   "buckets": {
     "core": ["core_index", "core_value"],

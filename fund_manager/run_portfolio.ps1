@@ -12,8 +12,8 @@
   which is what TradingAgents compares in is_historical(). A past -AnalysisDate
   is still a historical run.
 
-  Conservative and neutral default to openai/gpt-6-luna (the quick model already
-  used for per-stock runs). Opus is not a default. -AllowOpus passes --allow-opus.
+  Conservative is anthropic/claude-opus-5.5. Neutral is openai/gpt-6-luna and is
+  kept off the fund-manager model. -AllowOpus only lets Opus onto the other seats.
 
 .EXAMPLES
   .\addons\fund_manager\run_portfolio.ps1                        # latest reports, full flow (5 LLM calls)
@@ -34,8 +34,8 @@ param(
   [string]$Model = "openai/gpt-6.1-sol",                   # fund manager (draft + final)
   [string]$AggressiveModel = "openai/gpt-6.1-sol",
   [string]$NeutralModel = "openai/gpt-6-luna",             # different model from the fund manager
-  [string]$ConservativeModel = "openai/gpt-6-luna",        # was Opus; Luna is the cheap model already in use
-  [switch]$AllowOpus,                      # pass an Opus model through instead of replacing it
+  [string]$ConservativeModel = "anthropic/claude-opus-5.5",
+  [switch]$AllowOpus,                      # also allow Opus on the fund manager, aggressive, or neutral seat
   [int]$RiskRounds = 1,                    # 0 = no debate (draft is final)
   [string]$ReasoningEffort = "high",       # fund manager: low | medium | high | none
   [string]$AnalystEffort = "medium",       # risk analysts

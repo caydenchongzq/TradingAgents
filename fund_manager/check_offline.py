@@ -68,9 +68,14 @@ def main() -> int:
     assert fm.speaking_order(2, "2026-11-06")[0] != order_a[0]
 
     assert fm.QUICK_MODEL == "openai/gpt-6-luna"
-    assert "opus" not in fm.QUICK_MODEL
-    assert fm._without_opus("anthropic/claude-opus-5.5", False, "conservative") == fm.QUICK_MODEL
-    assert fm._without_opus("anthropic/claude-opus-5.5", True, "conservative") == "anthropic/claude-opus-5.5"
+    assert fm.CONSERVATIVE_MODEL == "anthropic/claude-opus-5.5"
+    assert fm._without_opus("anthropic/claude-opus-5.5", False, "conservative") == "anthropic/claude-opus-5.5"
+    assert fm._without_opus("anthropic/claude-opus-5.5", False, "neutral") == fm.QUICK_MODEL
+    assert fm.sleeve_fraction("AAPL", "ai_growth", fm.DEFAULT_AI_SLEEVE) == 0.0
+    assert fm.sleeve_fraction("MSFT", "megacap_quality", fm.DEFAULT_AI_SLEEVE) == 1.0
+    assert abs(fm.sleeve_fraction("SPY", "core_index", fm.DEFAULT_AI_SLEEVE) - 0.33) < 1e-9
+    half = fm.resolve_ai_sleeve({"ai_sleeve": {"ticker_weight": {"AAPL": 0.5}}})
+    assert half["ticker_weight"]["AAPL"] == 0.5 and half["ticker_weight"]["SPY"] == 0.33
 
     decision = {
         "cash_decision": {"target_cash_pct": 20},
@@ -86,11 +91,16 @@ def main() -> int:
     text = " ".join(check["warnings"])
     assert "below the $500 minimum" in text, text
     assert "exceeds the 12% cap" in text, text  # NVDA stays ~50%
-    assert "AI look-through" in text, text
+    assert "AI look-through" in text and "excluded: AAPL" in text, text
     assert "ATR fallback" in text, text  # NVDA and AAPL have no plan stop
     assert "earnings" in text, text
     risk = check["post_trade_risk"]
     assert risk["beta_spy"] > 1, risk
+    assert abs(risk["ai_lookthrough_pct"] - 56.1) < 0.15, risk
+    half_stats = _stats()
+    half_stats["risk_policy"] = {**fm.RISK_POLICY, "ai_sleeve": half}
+    half_ai = fm.validate_trades(decision, half_stats)["post_trade_risk"]["ai_lookthrough_pct"]
+    assert abs(half_ai - 58.2) < 0.15, half_ai
     assert "SPY_-10pct_beta_scaled" in risk["stress"]
     assert risk["stress"]["SPY_-10pct_beta_scaled"]["pnl_usd"] < 0
     spy = next(a for a in check["post_trade"] if a["ticker"] == "SPY")
