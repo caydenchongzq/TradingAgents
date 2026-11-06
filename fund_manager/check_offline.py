@@ -76,6 +76,18 @@ def main() -> int:
     assert abs(fm.sleeve_fraction("SPY", "core_index", fm.DEFAULT_AI_SLEEVE) - 0.33) < 1e-9
     half = fm.resolve_ai_sleeve({"ai_sleeve": {"ticker_weight": {"AAPL": 0.5}}})
     assert half["ticker_weight"]["AAPL"] == 0.5 and half["ticker_weight"]["SPY"] == 0.33
+    assert fm._policy_with_sleeve({})["ai_sleeve_cap_pct"] == 50
+    assert fm._policy_with_sleeve({"ai_sleeve": {"cap_pct": 42}})["ai_sleeve_cap_pct"] == 42
+    table = fm.subtheme_table([
+        {"ticker": "NVDA", "sub_theme": "ai_compute_semis", "weight_pct": 12.5, "market_value": 1000},
+        {"ticker": "AMD", "sub_theme": "ai_compute_semis", "weight_pct": 2.5, "market_value": 200},
+        {"ticker": "AAPL", "sub_theme": None, "weight_pct": 3, "market_value": 300},
+    ], {"subthemes": {"ai_compute_semis": ["NVDA", "AMD"], "ai_energy": ["VST"]},
+        "subtheme_labels": {"ai_compute_semis": "AI compute & semis", "ai_energy": "AI energy"}})
+    by = {row["id"]: row for row in table}
+    assert by["ai_compute_semis"]["weight_pct"] == 15.0
+    assert by["ai_energy"]["weight_pct"] == 0.0
+    assert fm.subtheme_of("NVDA", {"subthemes": {"ai_compute_semis": ["NVDA"]}}) == "ai_compute_semis"
 
     decision = {
         "cash_decision": {"target_cash_pct": 20},
@@ -91,7 +103,7 @@ def main() -> int:
     text = " ".join(check["warnings"])
     assert "below the $500 minimum" in text, text
     assert "exceeds the 12% cap" in text, text  # NVDA stays ~50%
-    assert "AI look-through" in text and "excluded: AAPL" in text, text
+    assert "AI look-through" in text and "excluded: AAPL" in text and "50%" in text, text
     assert "ATR fallback" in text, text  # NVDA and AAPL have no plan stop
     assert "earnings" in text, text
     risk = check["post_trade_risk"]

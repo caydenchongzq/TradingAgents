@@ -44,7 +44,9 @@ Other options: `-ConservativeModel anthropic/claude-opus-5.5` (the default), `-N
 - `themes.json` (this folder) - theme/bucket tags for concentration. Names in `ai_growth` count fully in the AI sleeve unless `ai_sleeve.ticker_weight` sets another fraction.
 
 ## AI sleeve
-`data\targets.json` -> `ai_sleeve`. `theme_weight` is the fraction of a theme that counts (ai_growth is 1). `ticker_weight` overrides that, and 0 excludes the ticker. Unlisted tickers keep the built-in defaults (MSFT, GOOG, and GOOGL at 1, SPY at 0.33, AAPL at 0). The add-on template is `addons\fund_manager\targets.json`.
+`data\targets.json` -> `ai_sleeve`. `cap_pct` is the look-through warn level (50). `theme_weight` is the fraction of a theme that counts (ai_growth is 1). `ticker_weight` overrides that, and 0 excludes the ticker. Unlisted tickers keep the built-in defaults (MSFT, GOOG, and GOOGL at 1, SPY at 0.33, AAPL at 0). The add-on template is `addons\fund_manager\targets.json`.
+
+`themes.json` -> `subthemes` tags holdings. `data\watchlist.json` carries the same `sub_theme` on candidates. The report and Argus show direct holding weight for ai_energy, ai_memory_storage, ai_compute_semis, ai_network_fibre, ai_cloud_software, and physical_ai. That table does not replace the sleeve cap, and it does not split SPY across the buckets. DISK sits with the memory names, NOK with network, GOOGL with GOOG, and SPCX (SpaceX) with physical AI. VST, BE, SMR, and FSLR are tagged ai_energy for the table and stay outside the ai_growth sleeve weight.
 
 AAPL is 0 because its Yahoo adjusted-close correlation to SMH, through the 2026-11-05 session, was about 0.05 over 252 sessions and -0.12 over 60 sessions. MSFT was 0.13 / 0.28 and GOOG was 0.28 / 0.16 on the same windows. The rule was to drop AAPL when that correlation is clearly below MSFT and GOOG (the example line was 0.5). On 5 Nov 2026, AAPL was -1.53% against SMH -11.21% and NVDA -9.26%.
 - Prompts/schemas: `FM_SYSTEM`, `ANALYST_ROLES`, `ANALYST_TASK`, `*_SCHEMA` in `fund_manager.py`.

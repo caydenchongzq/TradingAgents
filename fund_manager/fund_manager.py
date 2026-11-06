@@ -46,7 +46,16 @@ REGIME_SYMBOLS = ["QQQ", "SMH", "IWM", "^VIX", "^VIX3M"]
 DEFAULT_AI_SLEEVE = {
     "theme_weight": {"ai_growth": 1.0},
     "ticker_weight": {"AAPL": 0.0, "MSFT": 1.0, "GOOG": 1.0, "GOOGL": 1.0, "SPY": 0.33},
+    "cap_pct": 50.0,
 }
+SUBTHEMES = (
+    ("ai_energy", "AI energy"),
+    ("ai_memory_storage", "AI memory & storage"),
+    ("ai_compute_semis", "AI compute & semis"),
+    ("ai_network_fibre", "AI network & fibre"),
+    ("ai_cloud_software", "AI cloud & software"),
+    ("physical_ai", "Physical AI"),
+)
 FRED_LOOKBACK_DAYS = 800
 FRED_MONTHLY = {"fed_funds", "core_cpi_index", "unemployment"}
 RISK_POLICY = {
@@ -56,7 +65,7 @@ RISK_POLICY = {
     "short_history_cap_pct": 2.0,
     "short_history_bars": 252,
     "broad_index_cap_pct": 35.0,
-    "ai_sleeve_cap_pct": 35.0,
+    "ai_sleeve_cap_pct": 50.0,
     "ai_sleeve": DEFAULT_AI_SLEEVE,
     "top3_cap_pct": 50.0,
     "min_trade_usd": 500.0,
@@ -283,6 +292,46 @@ def fred_snapshot(as_of: str) -> dict:
 
 
 # --------------------------------------------------------------------------- analytics
+def subtheme_of(ticker: str, themes: dict | None, explicit: str | None = None) -> str | None:
+    if explicit:
+        return str(explicit)
+    for name, members in ((themes or {}).get("subthemes") or {}).items():
+        if ticker in members or str(ticker).upper() in {str(m).upper() for m in members}:
+            return str(name)
+    return None
+
+
+def subtheme_table(rows: list[dict], themes: dict | None = None) -> list[dict]:
+    """Direct holding weight by AI sub-theme. Untagged names are left out."""
+    defined = list(((themes or {}).get("subthemes") or {}).keys()) or [k for k, _ in SUBTHEMES]
+    labels = {k: v for k, v in SUBTHEMES}
+    labels.update((themes or {}).get("subtheme_labels") or {})
+    buckets = {
+        name: {"id": name, "label": labels.get(name, name), "weight_pct": 0.0, "market_value": 0.0, "tickers": []}
+        for name in defined
+    }
+    for row in rows:
+        name = row.get("sub_theme")
+        if not name:
+            continue
+        bucket = buckets.setdefault(name, {
+            "id": name, "label": labels.get(name, name), "weight_pct": 0.0, "market_value": 0.0, "tickers": []})
+        weight = float(row.get("weight_pct") or 0)
+        value = float(row.get("market_value") or 0)
+        bucket["weight_pct"] += weight
+        bucket["market_value"] += value
+        bucket["tickers"].append({
+            "ticker": row.get("ticker"), "weight_pct": round(weight, 1), "market_value": round(value, 2)})
+    order = defined + [name for name in buckets if name not in defined]
+    out = []
+    for name in order:
+        bucket = buckets[name]
+        bucket["weight_pct"] = round(bucket["weight_pct"], 1)
+        bucket["market_value"] = round(bucket["market_value"], 2)
+        out.append(bucket)
+    return out
+
+
 def theme_of(tk: str, themes: dict) -> str:
     for th, members in themes.get("themes", {}).items():
         if tk in members:
@@ -340,7 +389,7 @@ def load_watchlist(path: Path, held: list[str]) -> list[dict]:
             continue
         seen.add(tk)
         out.append({"ticker": tk, "sector": item.get("sector"), "type": item.get("type"),
-                    "theme": item.get("theme"), "note": item.get("note")})
+                    "theme": item.get("theme"), "sub_theme": item.get("sub_theme"), "note": item.get("note")})
     return out
 
 
@@ -447,6 +496,7 @@ def resolve_ai_sleeve(targets: dict | None) -> dict:
     for k, v in (raw.get("ticker_weight") or {}).items():
         tick[str(k).strip().upper()] = float(v)
     out = {"theme_weight": theme, "ticker_weight": tick}
+    out["cap_pct"] = float(raw["cap_pct"]) if raw.get("cap_pct") is not None else float(DEFAULT_AI_SLEEVE["cap_pct"])
     if raw.get("as_of"):
         out["as_of"] = str(raw["as_of"])
     return out
@@ -482,7 +532,7 @@ def sleeve_label(sleeve: dict | None) -> str:
 
 def _policy_with_sleeve(targets: dict | None) -> dict:
     sleeve = resolve_ai_sleeve(targets)
-    policy = {**RISK_POLICY, "ai_sleeve": sleeve}
+    policy = {**RISK_POLICY, "ai_sleeve": sleeve, "ai_sleeve_cap_pct": float(sleeve["cap_pct"])}
     spy = float((sleeve.get("ticker_weight") or {}).get(BENCH, 0.33))
     policy["spy_tech_share"] = spy
     policy["ai_megacap"] = sorted(
@@ -518,7 +568,8 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                      "market_value": mv, "cost_basis": qty * avg,
                      "unrealized_pnl": (mv - qty * avg) if mv is not None else None,
                      "unrealized_pnl_pct": ((px / avg - 1) * 100) if px and avg else None,
-                     "theme": th, "bucket": bucket_of(th, themes), **(meta.get(tk) or {})})
+                     "theme": th, "sub_theme": subtheme_of(tk, themes),
+                     "bucket": bucket_of(th, themes), **(meta.get(tk) or {})})
     invested = sum(r["market_value"] or 0 for r in rows)
     total = invested + cash
     for r in rows:
@@ -682,6 +733,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     for c in watchlist:
         tk = c["ticker"]
         ent = {**c, "price": quotes.get(tk, {}).get("price"), "has_agent_report": tk in reports,
+               "sub_theme": c.get("sub_theme") or subtheme_of(tk, themes),
                "agent_rating": reports.get(tk, {}).get("pm_rating") if tk in reports else None,
                **({k: v for k, v in (meta.get(tk) or {}).items() if k == "name"})}
         if tk not in win1 or win1[tk].dropna().empty:
@@ -743,6 +795,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
         "correlation_clusters": correlation_clusters(corr.drop(index=BENCH, columns=BENCH, errors="ignore"), corr_threshold),
         "correlation_threshold": corr_threshold,
         "target_drift": drift,
+        "ai_subthemes": subtheme_table(rows, themes),
         "watchlist": cands,
         "watchlist_swap_source": top_risk,
         "data_checks": data_checks,
@@ -779,6 +832,8 @@ Rules:
    top-3 cap, minimum trade size, and the AI sleeve cap. Sleeve membership is `risk_policy.ai_sleeve`
    (from targets.json): theme_weight applies to a theme, and ticker_weight overrides it. A weight of 0
    excludes that ticker even when its theme would count. Do not treat an excluded name as AI exposure.
+   `ai_sleeve_cap_pct` comes from targets.json (`ai_sleeve.cap_pct`). `ai_subthemes` is direct holding
+   weight by sub-theme and is not itself the look-through cap.
    Flag earnings inside earnings_warn_days rather than adding into them. Regime values carry their dates;
    a stale flag means the print is older than one session (or one release for monthly series).
 This is decision support, not financial advice."""
@@ -1304,14 +1359,14 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
     L.append("\n---\n## Appendix A - Portfolio snapshot")
     L.append(f"Total {fmt_money(acct['total_value'])} | invested {fmt_money(acct['invested'])} | cash "
              f"{fmt_money(acct['cash'])} ({acct['cash_pct']}%) | unrealized P&L {fmt_money(acct['unrealized_pnl'])}\n")
-    L.append("| Ticker | Shares | Avg cost | Price | Value | Weight | P&L % | 1m % | 3m % | vs SMA200 | Vol % | Beta 1y / 2y | Corr SPY 1y / 2y | Theme | Agent rating |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("| Ticker | Shares | Avg cost | Price | Value | Weight | P&L % | 1m % | 3m % | vs SMA200 | Vol % | Beta 1y / 2y | Corr SPY 1y / 2y | Theme | Sub-theme | Agent rating |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in sorted(stats["positions"], key=lambda r: -(r["weight_pct"] or 0)):
         L.append(f"| {r['ticker']} | {r['quantity']:g} | {r['avg_cost']:.2f} | {r['price'] or 0:.2f} | "
                  f"{fmt_money(r['market_value'])} | {r['weight_pct']:.1f}% | {r['unrealized_pnl_pct'] or 0:.1f} | "
                  f"{r.get('ret_1m_pct', '')} | {r.get('ret_3m_pct', '')} | {r.get('vs_sma200_pct', '')}% | {r.get('ann_vol_pct', '')} | "
                  f"{r.get('beta_1y', '')} / {r.get('beta_2y', '')}{' ⚠' if r.get('beta_unstable') else ''} | "
-                 f"{r.get('corr_spy_1y', '')} / {r.get('corr_spy_2y', '')} | {r['theme']} | "
+                 f"{r.get('corr_spy_1y', '')} / {r.get('corr_spy_2y', '')} | {r['theme']} | {r.get('sub_theme') or ''} | "
                  f"{reports.get(r['ticker'], {}).get('pm_rating', 'n/a')} |")
     rk = stats["risk"]
     L.append(f"\n**Risk:** portfolio vol {rk['portfolio_ann_vol_pct']}%/yr (SPY {rk['spy_ann_vol_pct']}%), beta "
@@ -1325,6 +1380,16 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
     L.append(f"\n**Concentration:** effective positions {c['effective_positions']}, top 3 "
              + ", ".join(f"{t['ticker']} {t['weight_pct']}%" for t in c["top3"])
              + ". Buckets: " + ", ".join(f"{k} {v}%" for k, v in c["by_bucket_pct"].items()))
+    cap = (stats.get("risk_policy") or {}).get("ai_sleeve_cap_pct")
+    L.append("\n### AI sub-themes")
+    L.append("Direct weight of tagged holdings. This table is not the sleeve look-through"
+             + (f" (warn cap **{float(cap):.0f}%** in targets.json)" if cap is not None else "")
+             + ". SPY's configured fraction stays in the look-through and is not split across sub-themes. "
+             "A holding with no sub-theme is omitted.")
+    L.append("| Sub-theme | Weight | Value | Holdings |\n|---|---|---|---|")
+    for bucket in stats.get("ai_subthemes") or []:
+        names = ", ".join(f"{t['ticker']} {t['weight_pct']}%" for t in bucket["tickers"]) or "—"
+        L.append(f"| {bucket['label']} | {bucket['weight_pct']}% | {fmt_money(bucket['market_value'])} | {names} |")
     L.append(f"\n**Correlation clusters (stocks linked by pairwise corr >= {stats['correlation_threshold']}, SPY excluded):** " + (
         "; ".join(f"{', '.join(g['tickers'])} (avg {g['avg_pairwise_corr']})" for g in stats["correlation_clusters"]) or "none"))
     def _fmt_regime(k, v):
@@ -1351,11 +1416,11 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
                      f"{x['drift_pct']:+}% | {x.get('shares_to_target', '')} |")
     if stats.get("watchlist"):
         L.append("\n### Watchlist candidates (not held)")
-        L.append(f"| Ticker | Sector | Type | Price | 1m % | 3m % | 1y % | vs SMA200 | Vol % | Beta 1y | Corr to book | Avg corr to holdings | Vol change +3% from cash (pp) | Vol change swap 3% out of {stats.get('watchlist_swap_source')} (pp) | Agent rating |")
-        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        L.append(f"| Ticker | Sector | Type | Sub-theme | Price | 1m % | 3m % | 1y % | vs SMA200 | Vol % | Beta 1y | Corr to book | Avg corr to holdings | Vol change +3% from cash (pp) | Vol change swap 3% out of {stats.get('watchlist_swap_source')} (pp) | Agent rating |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for w in stats["watchlist"]:
             swap = next((v for k, v in w.items() if k.startswith("port_vol_change_pp_swap")), "")
-            L.append(f"| {w['ticker']} | {w.get('sector') or ''} | {w.get('type') or ''} | {w.get('price') or 0:.2f} | "
+            L.append(f"| {w['ticker']} | {w.get('sector') or ''} | {w.get('type') or ''} | {w.get('sub_theme') or ''} | {w.get('price') or 0:.2f} | "
                      f"{w.get('ret_1m_pct', '')} | {w.get('ret_3m_pct', '')} | {w.get('ret_1y_pct', '')} | {w.get('vs_sma200_pct', '')} | "
                      f"{w.get('ann_vol_pct', '')} | {w.get('beta_1y', '')} | {w.get('corr_to_book_1y', '')} | "
                      f"{w.get('avg_corr_to_holdings_1y', '')} | {w.get('port_vol_change_pp_add3pct_from_cash', '')} | {swap} | "

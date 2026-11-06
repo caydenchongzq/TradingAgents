@@ -6,6 +6,22 @@
     "megacap_quality": ["AAPL", "MSFT", "GOOG"],
     "ai_growth": ["NVDA", "CRWV", "PLTR", "DRAM", "TSLA", "SPCX", "P", "NOK", "NBIS", "SKHY", "DISK", "NOW", "WDC", "SNDK", "NET", "ASML", "INTC", "AMD", "TSM", "ON"]
   },
+  "subthemes": {
+    "ai_energy": ["VST", "BE", "SMR", "FSLR"],
+    "ai_memory_storage": ["DRAM", "DISK", "WDC", "SNDK", "SKHY"],
+    "ai_compute_semis": ["NVDA", "AMD", "TSM", "ASML", "INTC", "ON"],
+    "ai_network_fibre": ["NET", "NOK"],
+    "ai_cloud_software": ["CRWV", "NBIS", "NOW", "PLTR", "MSFT", "GOOG", "GOOGL"],
+    "physical_ai": ["TSLA", "RKLB", "SPCX"]
+  },
+  "subtheme_labels": {
+    "ai_energy": "AI energy",
+    "ai_memory_storage": "AI memory & storage",
+    "ai_compute_semis": "AI compute & semis",
+    "ai_network_fibre": "AI network & fibre",
+    "ai_cloud_software": "AI cloud & software",
+    "physical_ai": "Physical AI"
+  },
   "buckets": {
     "core": ["core_index", "core_value"],
     "quality": ["megacap_quality"],
