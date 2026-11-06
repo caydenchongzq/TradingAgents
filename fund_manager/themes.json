@@ -8,7 +8,7 @@
   },
   "subthemes": {
     "ai_energy": ["VST", "BE", "SMR", "FSLR"],
-    "ai_memory_storage": ["DRAM", "DISK", "WDC", "SNDK", "SKHY"],
+    "ai_memory_storage": ["DRAM", "DISK", "WDC", "SNDK", "SKHY", "P"],
     "ai_compute_semis": ["NVDA", "AMD", "TSM", "ASML", "INTC", "ON"],
     "ai_network_fibre": ["NET", "NOK"],
     "ai_cloud_software": ["CRWV", "NBIS", "NOW", "PLTR", "MSFT", "GOOG", "GOOGL"],
