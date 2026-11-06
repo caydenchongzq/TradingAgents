@@ -1,0 +1,14 @@
+{
+  "_note": "Theme tags used by the fund manager for concentration checks. Edit freely; tickers not listed are tagged 'other'.",
+  "themes": {
+    "core_index": ["SPY"],
+    "core_value": ["BRK-B"],
+    "megacap_quality": ["AAPL", "MSFT", "GOOG"],
+    "ai_growth": ["NVDA", "CRWV", "PLTR", "DRAM", "TSLA", "SPCX", "P", "NOK"]
+  },
+  "buckets": {
+    "core": ["core_index", "core_value"],
+    "quality": ["megacap_quality"],
+    "ai_growth": ["ai_growth"]
+  }
+}
