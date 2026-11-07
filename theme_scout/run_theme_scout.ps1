@@ -29,8 +29,10 @@ $ProjectDir = (Resolve-Path (Join-Path $ScoutDir "..\..")).Path
 $FmDir = Join-Path $ProjectDir "addons\fund_manager"
 Set-Location $ProjectDir
 $NyTz = "EST5EDT,M3.2.0,M11.1.0"
-$pyArgs = @("/home/appuser/theme_scout/theme_scout.py", "--tier-n", "$TierN", "--model", $Model,
+$Addons = (Resolve-Path (Join-Path $ScoutDir "..")).Path
+$pyArgs = @("/home/appuser/theme_scout/theme_scout.py", "--tier-n", "$TierN",
             "--themes", "/home/appuser/addon/themes.json")
+if ($PSBoundParameters.ContainsKey("Model")) { $pyArgs += @("--model", $Model) }
 if ($Date) { $pyArgs += @("--date", $Date) }
 if ($Screen) { $pyArgs += "--screen" }
 if ($NoLLM) { $pyArgs += "--no-llm" }
@@ -39,5 +41,6 @@ if ($DryRun) { $pyArgs += "--dry-run" }
 & docker compose run --rm -T -e "TZ=$NyTz" --entrypoint python `
   -v "${ScoutDir}:/home/appuser/theme_scout:ro" `
   -v "${FmDir}:/home/appuser/addon:ro" `
+  -v "${Addons}:/home/appuser/addons:ro" `
   tradingagents @pyArgs
 exit $LASTEXITCODE

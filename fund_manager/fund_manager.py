@@ -541,13 +541,91 @@ def _policy_with_sleeve(targets: dict | None) -> dict:
     return policy
 
 
+def opus_on_other_seat(model: str, seat: str) -> bool:
+    return "opus" in (model or "").lower() and "conservative" not in (seat or "").lower()
+
+
 def _without_opus(model: str, allow_opus: bool, seat: str) -> str:
-    # The conservative seat is Opus by request. The gate stays on the other seats.
-    if seat == "conservative" or allow_opus or "opus" not in (model or "").lower():
+    """Opus on a non-conservative seat is a warning, not a substitution."""
+    if not opus_on_other_seat(model, seat) or allow_opus:
         return model
-    log(f"{seat} model {model} is an Opus model. This add-on keeps Opus on the conservative "
-        f"seat only. Using {QUICK_MODEL} instead. Pass --allow-opus to keep it on this seat.")
-    return QUICK_MODEL
+    log(f"warning: {seat} uses {model}. Opus stays locked on the conservative seat; "
+        "this choice is allowed and is not blocked.")
+    return model
+
+
+def _load_agent_config():
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "agent_config.py").is_file():
+        root = Path("/home/appuser/addons")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import agent_config
+    return agent_config
+
+
+def agent_plan_from_config() -> dict:
+    """Models, efforts, and system prompts the next fund-manager run will use."""
+    ac = _load_agent_config()
+    specs = (
+        ("fm_manager", DEFAULT_MODEL, "high", 24000, FM_SYSTEM),
+        ("fm_aggressive", DEFAULT_MODEL, "medium", 12000, ANALYST_ROLES["aggressive"]),
+        ("fm_conservative", CONSERVATIVE_MODEL, "medium", 12000, ANALYST_ROLES["conservative"]),
+        ("fm_neutral", QUICK_MODEL, "medium", 12000, ANALYST_ROLES["neutral"]),
+    )
+    plan = {}
+    for seat_id, builtin_model, builtin_effort, builtin_tokens, builtin_system in specs:
+        seat = ac.resolved_seat(seat_id)
+        plan[seat_id] = {
+            "model": seat.get("model") or builtin_model,
+            "effort": seat.get("effort"),
+            "max_tokens": seat.get("max_tokens") or builtin_tokens,
+            "temperature": seat.get("temperature"),
+            "system": seat.get("system") or builtin_system,
+            "locked": bool(seat.get("locked")),
+            "unlocked": bool(seat.get("unlocked")),
+        }
+    _separate_neutral(plan)
+    return plan
+
+
+def _separate_neutral(plan: dict) -> None:
+    if plan["fm_neutral"]["model"] != plan["fm_manager"]["model"]:
+        return
+    alt = QUICK_MODEL if plan["fm_manager"]["model"] != QUICK_MODEL else DEFAULT_MODEL
+    if alt == plan["fm_manager"]["model"]:
+        alt = QUICK_MODEL
+    log(f"neutral model {plan['fm_neutral']['model']} matches the fund manager; using {alt} instead")
+    plan["fm_neutral"]["model"] = alt
+
+
+def _apply_cli_overrides(plan: dict, args) -> dict:
+    mapping = {
+        "fm_manager": ("model", "reasoning_effort", "max_tokens"),
+        "fm_aggressive": ("aggressive_model", "analyst_effort", "analyst_max_tokens"),
+        "fm_conservative": ("conservative_model", "analyst_effort", "analyst_max_tokens"),
+        "fm_neutral": ("neutral_model", "analyst_effort", "analyst_max_tokens"),
+    }
+    labels = {"fm_manager": "fund manager", "fm_aggressive": "aggressive",
+              "fm_conservative": "conservative", "fm_neutral": "neutral"}
+    for seat_id, (model_attr, effort_attr, tokens_attr) in mapping.items():
+        spec = plan[seat_id]
+        cli_model = getattr(args, model_attr)
+        if spec["locked"] and not spec["unlocked"]:
+            if cli_model and cli_model != CONSERVATIVE_MODEL:
+                log(f"{seat_id} stays on {CONSERVATIVE_MODEL}. Unlock it in Argus to change the model.")
+            spec["model"] = CONSERVATIVE_MODEL
+        elif cli_model:
+            spec["model"] = cli_model
+        cli_effort = getattr(args, effort_attr)
+        if cli_effort:
+            spec["effort"] = None if cli_effort == "none" else cli_effort
+        cli_tokens = getattr(args, tokens_attr)
+        if cli_tokens:
+            spec["max_tokens"] = int(cli_tokens)
+        spec["model"] = _without_opus(spec["model"], args.allow_opus, labels[seat_id])
+    _separate_neutral(plan)
+    return plan
 
 
 def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, targets: dict | None,
@@ -942,7 +1020,7 @@ def build_context(book, targets, stats, reports, macro, as_of) -> str:
 
 
 def call_llm(model: str, system: str, user: str, schema: dict, name: str, max_tokens: int,
-             effort: str | None, label: str) -> dict:
+             effort: str | None, label: str, temperature: float | None = None) -> dict:
     from openai import OpenAI
 
     key = os.getenv("OPENROUTER_API_KEY")
@@ -960,6 +1038,8 @@ def call_llm(model: str, system: str, user: str, schema: dict, name: str, max_to
         try:
             t0 = time.time()
             kwargs = dict(model=model, messages=msgs, max_tokens=max_tokens, extra_body=extra)
+            if temperature is not None:
+                kwargs["temperature"] = float(temperature)
             if rf:
                 kwargs["response_format"] = rf
             if mode == "json_object":
@@ -987,8 +1067,7 @@ def call_llm(model: str, system: str, user: str, schema: dict, name: str, max_to
     raise RuntimeError(f"{label}: all LLM attempts failed: {last_err}")
 
 
-def run_debate(context: str, draft: dict, models: dict, rounds: int, max_tokens: int, effort: str | None,
-               anchor: str) -> list[dict]:
+def run_debate(context: str, draft: dict, plan: dict, rounds: int, anchor: str) -> list[dict]:
     transcript = []
     for rnd in range(1, rounds + 1):
         order = speaking_order(rnd, anchor)
@@ -1000,9 +1079,10 @@ def run_debate(context: str, draft: dict, models: dict, rounds: int, max_tokens:
             user = (context + "\n\n## Fund Manager DRAFT plan\n" + json.dumps(draft, indent=1)
                     + f"\n\n## Risk committee debate so far (round {rnd} of {rounds})\n" + prior
                     + "\n\n## Your task\n" + ANALYST_TASK)
-            res = call_llm(models[role], ANALYST_ROLES[role], user, ANALYST_SCHEMA, f"{role}_risk_view",
-                           max_tokens, effort, f"risk/{role} r{rnd}")
-            transcript.append({"round": rnd, "role": role, "model": models[role], "parsed": res["parsed"],
+            spec = plan[f"fm_{role}"]
+            res = call_llm(spec["model"], spec["system"], user, ANALYST_SCHEMA, f"{role}_risk_view",
+                           spec["max_tokens"], spec["effort"], f"risk/{role} r{rnd}", spec.get("temperature"))
+            transcript.append({"round": rnd, "role": role, "model": spec["model"], "parsed": res["parsed"],
                                "content": res["content"] if not res["parsed"] else None,
                                "usage": res["usage"], "seconds": res["seconds"], "mode": res["mode"]})
     return transcript
@@ -1471,22 +1551,22 @@ def main() -> int:
     ap.add_argument("--reports-dir", default=str(DATA_ROOT / "logs" / "reports"))
     ap.add_argument("--out-dir", default=str(DATA_ROOT / "fund_manager"))
     ap.add_argument("--since", default=None, help="only use reports generated on/after YYYY-MM-DD (UTC)")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="fund manager model (draft + final)")
-    ap.add_argument("--aggressive-model", default=os.getenv("FM_AGGRESSIVE_MODEL", DEFAULT_MODEL))
-    ap.add_argument("--neutral-model", default=os.getenv("FM_NEUTRAL_MODEL", QUICK_MODEL),
-                    help="must differ from the fund manager; default is the Luna quick model")
-    ap.add_argument("--conservative-model", default=os.getenv("FM_CONSERVATIVE_MODEL", CONSERVATIVE_MODEL),
-                    help="default is anthropic/claude-opus-5.5 and is always kept")
+    ap.add_argument("--model", default=None, help="fund manager model; omit to use addons/agent_config.json")
+    ap.add_argument("--aggressive-model", default=None)
+    ap.add_argument("--neutral-model", default=None,
+                    help="must differ from the fund manager; omit to use agent_config.json")
+    ap.add_argument("--conservative-model", default=None,
+                    help="ignored while the conservative seat is locked to anthropic/claude-opus-5.5")
     ap.add_argument("--allow-opus", action="store_true",
                     help="also permit an Opus model on the fund manager, aggressive, or neutral seat")
     ap.add_argument("--risk-rounds", type=int, default=1, help="risk committee rounds (0 = no debate)")
-    ap.add_argument("--reasoning-effort", default=os.getenv("FUND_MANAGER_REASONING_EFFORT", "high"),
-                    help="fund manager effort: low|medium|high|none")
-    ap.add_argument("--analyst-effort", default="medium", help="risk analysts effort: low|medium|high|none")
+    ap.add_argument("--reasoning-effort", default=None,
+                    help="fund manager effort: low|medium|high|none; omit to use agent_config.json")
+    ap.add_argument("--analyst-effort", default=None, help="risk analysts effort: low|medium|high|none")
     ap.add_argument("--cash-min", type=float, default=None)
     ap.add_argument("--cash-max", type=float, default=None)
-    ap.add_argument("--max-tokens", type=int, default=24000)
-    ap.add_argument("--analyst-max-tokens", type=int, default=12000)
+    ap.add_argument("--max-tokens", type=int, default=None)
+    ap.add_argument("--analyst-max-tokens", type=int, default=None)
     ap.add_argument("--max-report-chars", type=int, default=6000, help="per-section cap for agent text")
     ap.add_argument("--include-risk", action="store_true", help="also feed the per-stock risk-debate notes")
     ap.add_argument("--corr-threshold", type=float, default=0.5)
@@ -1539,31 +1619,32 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     pre = "snapshot_" if args.no_llm else ""
     context = build_context(book, targets, stats, reports, macro, args.date)
-    (out_dir / f"{pre}prompt.md").write_text(FM_SYSTEM + "\n\n" + context, encoding="utf-8")
+    plan = _apply_cli_overrides(agent_plan_from_config(), args)
+    fm_spec = plan["fm_manager"]
+    (out_dir / f"{pre}prompt.md").write_text(fm_spec["system"] + "\n\n" + context, encoding="utf-8")
     (out_dir / f"{pre}portfolio_stats.json").write_text(json.dumps(stats, indent=2, default=str), encoding="utf-8")
 
-    args.model = _without_opus(args.model, args.allow_opus, "fund manager")
-    args.aggressive_model = _without_opus(args.aggressive_model, args.allow_opus, "aggressive")
-    args.conservative_model = _without_opus(args.conservative_model, args.allow_opus, "conservative")
-    args.neutral_model = _without_opus(args.neutral_model, args.allow_opus, "neutral")
-    if args.neutral_model == args.model:
-        replacement = QUICK_MODEL if args.model != QUICK_MODEL else DEFAULT_MODEL
-        if replacement == args.model:
-            replacement = QUICK_MODEL
-        log(f"neutral model {args.neutral_model} matches the fund manager; using {replacement} instead")
-        args.neutral_model = replacement
+    args.model = fm_spec["model"]
+    args.aggressive_model = plan["fm_aggressive"]["model"]
+    args.conservative_model = plan["fm_conservative"]["model"]
+    args.neutral_model = plan["fm_neutral"]["model"]
+    log("agent config: " + ", ".join(
+        f"{name}={plan[key]['model']} effort={plan[key]['effort']} max_tokens={plan[key]['max_tokens']}"
+        for name, key in (("fm", "fm_manager"), ("aggressive", "fm_aggressive"),
+                          ("conservative", "fm_conservative"), ("neutral", "fm_neutral"))))
     models = {"fm": args.model, "aggressive": args.aggressive_model, "conservative": args.conservative_model,
               "neutral": args.neutral_model,
-              "note": "Conservative is anthropic/claude-opus-5.5. Neutral is openai/gpt-6-luna and is kept "
-                      "different from the fund manager. Opus is not used on the other seats unless --allow-opus. "
-                      "AI sleeve weights come from targets.json."}
-    eff = lambda e: None if e == "none" else e  # noqa: E731
+              "note": "Models, effort, and system prompts come from addons/agent_config.json. "
+                      "The conservative seat is locked to anthropic/claude-opus-5.5 until it is unlocked in Argus. "
+                      "Opus on any other seat is a warning, not a block. Neutral is kept different from the fund manager."}
+    eff = lambda e: None if e in (None, "none") else e  # noqa: E731
     calls, draft, debate, final, check_d, check_f = [], None, [], None, None, None
     if not args.no_llm:
-        log(f"[1/3] fund manager DRAFT ({args.model}, prompt ~{len(context) // 4:,} tokens) ...")
-        r = call_llm(args.model, FM_SYSTEM, context + "\n\n## Task\nWrite your DRAFT whole-portfolio plan. Every holding must "
+        log(f"[1/3] fund manager DRAFT ({fm_spec['model']}, prompt ~{len(context) // 4:,} tokens) ...")
+        r = call_llm(fm_spec["model"], fm_spec["system"], context + "\n\n## Task\nWrite your DRAFT whole-portfolio plan. Every holding must "
                      "appear exactly once in `trades` (HOLD 0 if unchanged); add watchlist buys only if justified.",
-                     DRAFT_SCHEMA, "fund_manager_draft", args.max_tokens, eff(args.reasoning_effort), "fm/draft")
+                     DRAFT_SCHEMA, "fund_manager_draft", fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/draft",
+                     fm_spec.get("temperature"))
         r["model_req"] = args.model
         calls.append(r)
         draft = r["parsed"]
@@ -1571,8 +1652,7 @@ def main() -> int:
             check_d = validate_trades(draft, stats)
         if draft and args.risk_rounds > 0:
             log(f"[2/3] risk committee debate, {args.risk_rounds} round(s) ...")
-            debate = run_debate(context, {**draft, "_post_trade_check": check_d}, models, args.risk_rounds,
-                                args.analyst_max_tokens, eff(args.analyst_effort), args.date)
+            debate = run_debate(context, {**draft, "_post_trade_check": check_d}, plan, args.risk_rounds, args.date)
             calls += [{"label": f"risk/{t['role']} r{t['round']}", "model_req": t["model"], "mode": t["mode"],
                        "seconds": t["seconds"], "usage": t["usage"]} for t in debate]
             log("[3/3] fund manager FINAL ...")
@@ -1585,8 +1665,8 @@ def main() -> int:
                       "(do not just average), revisit the cash target, and list every change vs the draft with the reason "
                       "in `changes_vs_draft` (empty list if none). Summarise how you treated the key debate points in "
                       "`debate_takeaways`. Every holding must appear exactly once in `trades`.")
-            r = call_llm(args.model, FM_SYSTEM, user, FINAL_SCHEMA, "fund_manager_final", args.max_tokens,
-                         eff(args.reasoning_effort), "fm/final")
+            r = call_llm(fm_spec["model"], fm_spec["system"], user, FINAL_SCHEMA, "fund_manager_final",
+                         fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/final", fm_spec.get("temperature"))
             r["model_req"] = args.model
             calls.append(r)
             final = r["parsed"]

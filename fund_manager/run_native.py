@@ -125,5 +125,22 @@ _install_cost_hook()
 atexit.register(_write_cost)
 
 
+def _boot_agent_config() -> None:
+    """Load addons/agent_config.json and patch seat factories. No model call."""
+    addons = Path("/home/appuser/addons")
+    if not (addons / "agent_config.py").is_file():
+        addons = Path(__file__).resolve().parents[1]
+    if str(addons) not in sys.path:
+        sys.path.insert(0, str(addons))
+    try:
+        import agent_config
+        agent_config.install_native_seats(DEFAULT_CONFIG)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[run_native] agent config was not installed: {exc}", flush=True)
+
+
+_boot_agent_config()
+
+
 if __name__ == "__main__":
     app()

@@ -15,6 +15,7 @@ import math
 import os
 import re
 import shutil
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -498,7 +499,26 @@ name explicitly. Prefer dropping weak relative-strength names over adding lookal
 not an order."""
 
 
-def call_scout(model: str, context: str) -> dict:
+def agent_plan_from_config() -> dict:
+    """The theme-scout seat the next run reads from addons/agent_config.json."""
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "agent_config.py").is_file():
+        root = Path("/home/appuser/addons")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import agent_config
+    seat = agent_config.resolved_seat("theme_scout")
+    return {"theme_scout": {
+        "model": seat.get("model") or DEEP_MODEL,
+        "system": seat.get("system") or SCOUT_SYSTEM,
+        "max_tokens": seat.get("max_tokens") or 6000,
+        "effort": seat.get("effort"),
+        "temperature": seat.get("temperature"),
+    }}
+
+
+def call_scout(model: str, context: str, system: str | None = None, max_tokens: int | None = None,
+               effort: str | None = None, temperature: float | None = None) -> dict:
     from openai import OpenAI
 
     key = os.getenv("OPENROUTER_API_KEY")
@@ -527,14 +547,20 @@ def call_scout(model: str, context: str) -> dict:
     }
     client = OpenAI(base_url=OPENROUTER_BASE, api_key=key, timeout=900, max_retries=2)
     t0 = time.time()
-    resp = client.chat.completions.create(
+    extra = {"usage": {"include": True}}
+    if effort:
+        extra["reasoning"] = {"effort": effort}
+    kwargs = dict(
         model=model,
-        messages=[{"role": "system", "content": SCOUT_SYSTEM},
+        messages=[{"role": "system", "content": system or SCOUT_SYSTEM},
                   {"role": "user", "content": context + "\n\nReturn the JSON object only."}],
-        max_tokens=6000,
+        max_tokens=max_tokens or 6000,
         response_format={"type": "json_schema", "json_schema": {"name": "theme_scout", "strict": True, "schema": schema}},
-        extra_body={"usage": {"include": True}},
+        extra_body=extra,
     )
+    if temperature is not None:
+        kwargs["temperature"] = float(temperature)
+    resp = client.chat.completions.create(**kwargs)
     content = resp.choices[0].message.content or "{}"
     usage = resp.usage.model_dump() if resp.usage else {}
     return {"parsed": json.loads(content), "model": model, "seconds": round(time.time() - t0, 1), "usage": usage}
@@ -554,8 +580,10 @@ def main() -> int:
     ap.add_argument("--no-llm", action="store_true", help="weekly pack without a model call or watchlist edit")
     ap.add_argument("--dry-run", action="store_true", help="same as --no-llm")
     ap.add_argument("--tier-n", type=int, default=8)
-    ap.add_argument("--model", default=DEEP_MODEL)
+    ap.add_argument("--model", default=None, help="omit to use addons/agent_config.json")
     args = ap.parse_args()
+    scout = agent_plan_from_config()["theme_scout"]
+    scout_model = args.model or scout["model"]
     no_llm = args.no_llm or args.dry_run or args.screen
 
     root = Path(args.data_root)
@@ -624,10 +652,11 @@ def main() -> int:
             "watchlist": [w["ticker"] for w in watch],
             "subthemes": list(subthemes),
         }, indent=1, default=str)
-        log(f"one scout call ({args.model})")
-        result = call_scout(args.model, context)
+        log(f"one scout call ({scout_model})")
+        log(f"agent config: theme_scout={scout_model} effort={scout['effort']} max_tokens={scout['max_tokens']}")
+        result = call_scout(scout_model, context, scout["system"], scout["max_tokens"], scout["effort"], scout["temperature"])
         parsed = result["parsed"]
-        payload["llm"] = {"model": args.model, "seconds": result["seconds"], "usage": result["usage"]}
+        payload["llm"] = {"model": scout_model, "seconds": result["seconds"], "usage": result["usage"]}
         payload["headline"] = parsed.get("headline") or ""
         payload["themes"] = parsed.get("themes") or []
         scores = {r["ticker"]: r.get("score") if r.get("score") is not None else -1e9 for r in ranked}

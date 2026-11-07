@@ -70,7 +70,9 @@ def main() -> int:
     assert fm.QUICK_MODEL == "openai/gpt-6-luna"
     assert fm.CONSERVATIVE_MODEL == "anthropic/claude-opus-5.5"
     assert fm._without_opus("anthropic/claude-opus-5.5", False, "conservative") == "anthropic/claude-opus-5.5"
-    assert fm._without_opus("anthropic/claude-opus-5.5", False, "neutral") == fm.QUICK_MODEL
+    assert fm.opus_on_other_seat("anthropic/claude-opus-5.5", "neutral")
+    assert not fm.opus_on_other_seat("anthropic/claude-opus-5.5", "conservative")
+    assert fm._without_opus("anthropic/claude-opus-5.5", False, "neutral") == "anthropic/claude-opus-5.5"
     assert fm.sleeve_fraction("AAPL", "ai_growth", fm.DEFAULT_AI_SLEEVE) == 0.0
     assert fm.sleeve_fraction("MSFT", "megacap_quality", fm.DEFAULT_AI_SLEEVE) == 1.0
     assert abs(fm.sleeve_fraction("SPY", "core_index", fm.DEFAULT_AI_SLEEVE) - 0.33) < 1e-9

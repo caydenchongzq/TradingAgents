@@ -71,7 +71,11 @@ if (-not (Test-Path (Join-Path $DataDir "targets.json"))) {
 if (-not (Test-Path (Join-Path $DataDir "watchlist.json"))) { Set-Content (Join-Path $DataDir "watchlist.json") "[]" }
 
 function Invoke-TaPython([string[]]$PyArgs) {
-  & docker compose run --rm -T -e "TZ=$NyTz" --entrypoint python -v "${AddonDir}:/home/appuser/addon:ro" tradingagents @PyArgs
+  $Addons = (Resolve-Path (Join-Path $AddonDir "..")).Path
+  & docker compose run --rm -T -e "TZ=$NyTz" --entrypoint python `
+    -v "${AddonDir}:/home/appuser/addon:ro" `
+    -v "${Addons}:/home/appuser/addons:ro" `
+    tradingagents @PyArgs
 }
 
 function Get-BookTickers {
@@ -116,8 +120,10 @@ if ($Tiered) {
   Write-Host "Theme screen (top $TierN candidates, no model call) ..." -ForegroundColor Cyan
   $scoutArgs = @("/home/appuser/theme_scout/theme_scout.py", "--screen", "--date", $AnalysisDate,
                  "--tier-n", "$TierN", "--themes", "/home/appuser/addon/themes.json")
+  $Addons = (Resolve-Path (Join-Path $AddonDir "..")).Path
   $scoutRaw = & docker compose run --rm -T -e "TZ=$NyTz" --entrypoint python `
     -v "${ScoutDir}:/home/appuser/theme_scout:ro" -v "${AddonDir}:/home/appuser/addon:ro" `
+    -v "${Addons}:/home/appuser/addons:ro" `
     tradingagents @scoutArgs 2>&1
   $scoutCode = $LASTEXITCODE
   $scoutRaw | ForEach-Object { Write-Host $_ }
@@ -171,10 +177,14 @@ if ($IncludeWatchlist -and -not $Tiered) {
 # After a full holdings rerun, only use this session's reports. Partial reruns keep older reports for the rest.
 if ((($RunAgents) -or ($Tiered -and -not $NoLLM)) -and -not $Tickers -and -not $Since) { $Since = $AnalysisDate }
 
-$fmArgs = @("/home/appuser/addon/fund_manager.py", "--date", $AnalysisDate,
-            "--model", $Model, "--aggressive-model", $AggressiveModel, "--neutral-model", $NeutralModel,
-            "--conservative-model", $ConservativeModel, "--risk-rounds", "$RiskRounds",
-            "--reasoning-effort", $ReasoningEffort, "--analyst-effort", $AnalystEffort)
+$fmArgs = @("/home/appuser/addon/fund_manager.py", "--date", $AnalysisDate, "--risk-rounds", "$RiskRounds")
+# Explicit switches override addons/agent_config.json. Omitted switches use that file.
+if ($PSBoundParameters.ContainsKey("Model")) { $fmArgs += @("--model", $Model) }
+if ($PSBoundParameters.ContainsKey("AggressiveModel")) { $fmArgs += @("--aggressive-model", $AggressiveModel) }
+if ($PSBoundParameters.ContainsKey("NeutralModel")) { $fmArgs += @("--neutral-model", $NeutralModel) }
+if ($PSBoundParameters.ContainsKey("ConservativeModel")) { $fmArgs += @("--conservative-model", $ConservativeModel) }
+if ($PSBoundParameters.ContainsKey("ReasoningEffort")) { $fmArgs += @("--reasoning-effort", $ReasoningEffort) }
+if ($PSBoundParameters.ContainsKey("AnalystEffort")) { $fmArgs += @("--analyst-effort", $AnalystEffort) }
 if ($AllowOpus)      { $fmArgs += "--allow-opus" }
 if ($CashMin -ge 0)  { $fmArgs += @("--cash-min", "$CashMin") }
 if ($CashMax -ge 0)  { $fmArgs += @("--cash-max", "$CashMax") }
