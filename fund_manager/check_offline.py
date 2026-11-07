@@ -270,6 +270,13 @@ def main() -> int:
     assert 30 <= len(names) <= 50, len(names)
     for ticker in ("QQQ", "SMH", "IWM", "XLE", "XLF", "GLD"):
         assert ticker in names, ticker
+    import pandas as pd
+    idx = pd.bdate_range("2025-10-01", "2025-11-06")
+    close = pd.DataFrame({"SPY": [100 + i for i in range(len(idx))]}, index=idx)
+    quotes = fm.live_quotes(["SPY"], close, "2025-11-06")
+    assert quotes["SPY"]["timing"] == "as_of", quotes
+    assert quotes["SPY"]["price"] == close["SPY"].iloc[-1]
+    assert "live" not in (quotes["SPY"]["source"] or "")
     print("check_offline: ok")
     print(f"  plan 213439 core ETF {live['sleeves']['core_etf']['weight_pct']}% "
           f"swing {live['sleeves']['swing']['weight_pct']}% status {live['sleeves']['status']}")

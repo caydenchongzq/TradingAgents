@@ -30,12 +30,7 @@ MIN_WATCH = 30
 MAX_WATCH = 50
 SECTORS = ["XLK", "XLY", "XLV", "XLP", "XLU", "XLE", "XLF", "SMH"]
 WINDOWS = {"1w": 5, "1m": 21, "3m": 63}
-FRED_SERIES = {
-    "fed_funds": "FEDFUNDS", "10y_treasury": "DGS10", "2y_treasury": "DGS2",
-    "10y_2y_spread": "T10Y2Y", "vix": "VIXCLS", "core_cpi_index": "CPILFESL",
-    "unemployment": "UNRATE",
-}
-FRED_MONTHLY = {"fed_funds", "core_cpi_index", "unemployment"}
+HISTORY_DAYS = 430  # about 14 months of calendar days
 
 
 def log(msg: str) -> None:
@@ -115,12 +110,33 @@ def _panel(raw: pd.DataFrame, field: str) -> pd.DataFrame:
     return frame.sort_index()
 
 
-def download_ohlc(tickers: list[str]) -> dict[str, pd.DataFrame]:
+def _addons():
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "macro_panel.py").is_file():
+        root = Path("/home/appuser/addons")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    return root
+
+
+def download_ohlc(tickers: list[str], as_of: str | None = None) -> dict[str, pd.DataFrame]:
     import yfinance as yf
 
+    _addons()
+    import macro_panel
+
     symbols = [t for t in dict.fromkeys(tickers) if t]
-    raw = yf.download(symbols, period="14mo", auto_adjust=True, progress=False, threads=False, group_by="column")
-    return {field: _panel(raw, field) for field in ("Open", "High", "Low", "Close")}
+    if as_of:
+        # A fixed window that ends at the decision date. period= would end at the wall clock.
+        start, end = macro_panel.history_window(as_of, HISTORY_DAYS)
+        raw = yf.download(symbols, start=start, end=end, auto_adjust=True, progress=False, threads=False,
+                          group_by="column")
+    else:
+        raw = yf.download(symbols, period="14mo", auto_adjust=True, progress=False, threads=False, group_by="column")
+    panels = {field: _panel(raw, field) for field in ("Open", "High", "Low", "Close")}
+    if as_of:
+        panels = {field: macro_panel.clip_frame(frame, as_of) for field, frame in panels.items()}
+    return panels
 
 
 def _ret(series: pd.Series, sessions: int) -> float | None:
@@ -235,6 +251,8 @@ def screen_frame(close: pd.DataFrame, high: pd.DataFrame, low: pd.DataFrame,
         row["atr_pct"] = None if atr is None else round(atr, 2)
         days = earnings.get(tk)
         row["earnings_days"] = days
+        # Yahoo's earnings calendar is a live feed. It has no vintage for --date.
+        row["earnings_timing"] = "live"
         rows.append(row)
     zs = {key: _z([r.get(key) for r in rows]) for key in ("rs_1w", "rs_1m", "rs_3m")}
     for i, row in enumerate(rows):
@@ -267,34 +285,9 @@ def group_rs(close: pd.DataFrame, groups: dict[str, list[str]], spy: str) -> lis
 
 
 def fred_snapshot(as_of: str) -> dict:
-    try:
-        from tradingagents.dataflows.vendors import fred
-    except Exception as e:  # noqa: BLE001
-        return {"error": _safe(e)}
-    as_of_dt = datetime.strptime(as_of, "%Y-%m-%d")
-    start = (as_of_dt - timedelta(days=800)).strftime("%Y-%m-%d")
-    out = {}
-    for name, sid in FRED_SERIES.items():
-        try:
-            data = fred._request("series/observations", {
-                "series_id": sid, "observation_start": start, "observation_end": as_of,
-                "sort_order": "desc", "limit": 900})
-            obs = [o for o in data.get("observations", []) if o.get("value") not in (".", None)]
-            if not obs:
-                continue
-            latest = obs[0]
-            age = (as_of_dt - datetime.strptime(latest["date"], "%Y-%m-%d")).days
-            entry = {"date": latest["date"], "value": float(latest["value"]), "age_days": age,
-                     "stale": age > (45 if name in FRED_MONTHLY else 4)}
-            if sid == "CPILFESL":
-                target = (datetime.strptime(latest["date"], "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
-                older = [o for o in obs if o["date"] <= target]
-                if older and float(older[0]["value"]):
-                    entry["yoy_pct"] = round((entry["value"] / float(older[0]["value"]) - 1) * 100, 2)
-            out[name] = entry
-        except Exception as e:  # noqa: BLE001
-            out[name] = {"error": _safe(e)}
-    return out
+    _addons()
+    import macro_panel
+    return macro_panel.fred_snapshot(as_of)
 
 
 def yahoo_headlines(symbols: list[str], limit: int = 12) -> list[dict]:
@@ -426,7 +419,8 @@ def render_screen_md(as_of: str, ranked: list[dict]) -> str:
         lines.append(
             f"| {row['rank']} | {row['ticker']} | {row.get('score')} | {_fmt(row.get('rs_1w'))} | {_fmt(row.get('rs_1m'))} | "
             f"{_fmt(row.get('rs_3m'))} | {_fmt(row.get('dist_ma20'))} | {_fmt(row.get('dist_ma50'))} | {_fmt(row.get('dist_ma200'))} | "
-            f"{_fmt(row.get('atr_pct'))} | {'' if row.get('earnings_days') is None else row['earnings_days']} |")
+            f"{_fmt(row.get('atr_pct'))} | {'' if row.get('earnings_days') is None else row['earnings_days']}"
+            f"{' live' if row.get('earnings_timing') == 'live' else ''} |")
     return "\n".join(lines) + "\n"
 
 
@@ -453,7 +447,9 @@ def render_report_md(payload: dict) -> str:
             else:
                 extra = f", YoY {value['yoy_pct']}%" if value.get("yoy_pct") is not None else ""
                 flag = " STALE" if value.get("stale") else ""
-                lines.append(f"- {key}: {value.get('value')} ({value.get('date')}, age {value.get('age_days')}d{extra}{flag})")
+                lines.append(
+                    f"- {key}: {value.get('value')} (obs {value.get('date')}, as_of {value.get('as_of')}, "
+                    f"vintage {value.get('vintage')}, age {value.get('age_days')}d{extra}{flag})")
     lines.append("\n## Headlines")
     for item in payload.get("headlines") or []:
         if item.get("error") and not item.get("title"):
@@ -467,7 +463,7 @@ def render_report_md(payload: dict) -> str:
     lines.append("\n## Earnings within 14 days")
     soon = [r for r in payload.get("screen") or [] if isinstance(r.get("earnings_days"), int) and r["earnings_days"] <= 14]
     if soon:
-        lines.append(", ".join(f"{r['ticker']} in {r['earnings_days']}d" for r in soon))
+        lines.append(", ".join(f"{r['ticker']} in {r['earnings_days']}d (live calendar, no vintage)" for r in soon))
     else:
         lines.append("None in the screened names.")
     lines.append("\n## Book and watchlist ranking")
@@ -681,7 +677,7 @@ def main() -> int:
 
     universe = list(dict.fromkeys(holdings + [w["ticker"] for w in watch] + SECTORS + ["SPY"]))
     log(f"downloading prices for {len(universe)} symbols")
-    ohlc = download_ohlc(universe)
+    ohlc = download_ohlc(universe, args.date)
     close, high, low = ohlc["Close"], ohlc["High"], ohlc["Low"]
     screen_names = list(dict.fromkeys(holdings + [w["ticker"] for w in watch]))
     etf_names = {w["ticker"] for w in watch if (w.get("type") or "").lower() == "etf"} | set(SECTORS) | {"SPY"}
@@ -707,8 +703,13 @@ def main() -> int:
         log(f"screen only: {out_dir / 'screen.md'}")
         return 0
 
+    _addons()
+    import macro_panel
     macro = fred_snapshot(args.date)
-    headlines = yahoo_headlines(["SPY", "QQQ", "SMH"]) + av_headlines(args.date)
+    headlines = macro_panel.filter_headlines(yahoo_headlines(["SPY", "QQQ", "SMH"]) + av_headlines(args.date), args.date)
+    for item in headlines:
+        if item.get("source") == "yfinance":
+            item["timing"] = "live"
     payload = {
         "date": args.date,
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),

@@ -59,8 +59,6 @@ SUBTHEMES = (
     ("ai_cloud_software", "AI cloud & software"),
     ("physical_ai", "Physical AI"),
 )
-FRED_LOOKBACK_DAYS = 800
-FRED_MONTHLY = {"fed_funds", "core_cpi_index", "unemployment"}
 RISK_POLICY = {
     "single_stock_cap_pct": 12.0,
     "high_vol_cap_pct": 3.0,
@@ -199,19 +197,49 @@ def parse_report(tk: str, d: Path, include_risk: bool, max_chars: int) -> dict:
 
 
 # --------------------------------------------------------------------------- market data
-def fetch_prices(tickers: list[str], period: str = "2y") -> pd.DataFrame:
+def _addons_root() -> Path:
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "macro_panel.py").is_file():
+        root = Path("/home/appuser/addons")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    return root
+
+
+def _period_days(period: str) -> int:
+    """Calendar days for a yfinance period such as 2y or 14mo, with a few spare days."""
+    m = re.fullmatch(r"(\d+)(y|mo|d)", str(period).strip())
+    if not m:
+        return 740
+    n, unit = int(m.group(1)), m.group(2)
+    return n * 365 + 10 if unit == "y" else (n * 31 + 5 if unit == "mo" else n)
+
+
+def fetch_prices(tickers: list[str], period: str = "2y", as_of: str | None = None) -> pd.DataFrame:
     import yfinance as yf
 
     syms = sorted(set(tickers + [BENCH]))
     for attempt in range(3):
         try:
-            df = yf.download(syms, period=period, interval="1d", auto_adjust=True,
-                             progress=False, group_by="column", threads=True)
+            if as_of:
+                _addons_root()
+                import macro_panel
+                # Window ends at the decision date. period= would end at the wall clock.
+                start, end = macro_panel.history_window(as_of, _period_days(period))
+                df = yf.download(syms, start=start, end=end, interval="1d", auto_adjust=True,
+                                 progress=False, group_by="column", threads=True)
+            else:
+                df = yf.download(syms, period=period, interval="1d", auto_adjust=True,
+                                 progress=False, group_by="column", threads=True)
             close = df["Close"] if isinstance(df.columns, pd.MultiIndex) else df[["Close"]]
             if isinstance(close, pd.Series):
                 close = close.to_frame(syms[0])
             close = close.dropna(how="all")
             if not close.empty:
+                if as_of:
+                    _addons_root()
+                    import macro_panel
+                    close = macro_panel.clip_frame(close, as_of)
                 return close
         except Exception as e:  # noqa: BLE001
             log(f"yfinance download failed (attempt {attempt + 1}): {e}")
@@ -219,33 +247,40 @@ def fetch_prices(tickers: list[str], period: str = "2y") -> pd.DataFrame:
     raise RuntimeError("Could not download price history from yfinance")
 
 
-def fetch_prices_with_regime(tickers: list[str]) -> pd.DataFrame:
+def fetch_prices_with_regime(tickers: list[str], as_of: str | None = None) -> pd.DataFrame:
     """Holdings plus the regime tape. A bad index symbol must not sink the book download."""
     try:
-        return fetch_prices(list(tickers) + REGIME_SYMBOLS)
+        return fetch_prices(list(tickers) + REGIME_SYMBOLS, as_of=as_of)
     except RuntimeError:
         log("price download failed with regime symbols; retrying holdings only")
-        return fetch_prices(list(tickers))
+        return fetch_prices(list(tickers), as_of=as_of)
 
 
-def live_quotes(tickers: list[str], close: pd.DataFrame) -> dict:
-    """Best-effort latest price; falls back to last daily close."""
-    import yfinance as yf
+def live_quotes(tickers: list[str], close: pd.DataFrame, as_of: str | None = None) -> dict:
+    """Best-effort latest price; falls back to last daily close.
 
+    A decision date before today uses the clipped close. Yahoo fast_info is live
+    and has no vintage, so it is labeled when it is used.
+    """
+    historical = bool(as_of) and as_of < date.today().isoformat()
     out = {}
     for tk in tickers:
-        px, src = None, None
-        try:
-            fi = yf.Ticker(tk).fast_info
-            px = float(fi["last_price"]) if fi["last_price"] else None
-            src = "yfinance fast_info last_price"
-        except Exception:  # noqa: BLE001
-            px = None
+        px, src, timing = None, None, "as_of" if historical else None
+        if not historical:
+            try:
+                import yfinance as yf
+                fi = yf.Ticker(tk).fast_info
+                px = float(fi["last_price"]) if fi["last_price"] else None
+                src = "yfinance fast_info last_price"
+                timing = "live"
+            except Exception:  # noqa: BLE001
+                px = None
         if (px is None or not math.isfinite(px)) and tk in close:
             s = close[tk].dropna()
             if len(s):
                 px, src = float(s.iloc[-1]), f"last close {s.index[-1].date()}"
-        out[tk] = {"price": px, "source": src}
+                timing = "as_of"
+        out[tk] = {"price": px, "source": src, "as_of": as_of, "timing": timing or "as_of"}
     return out
 
 
@@ -257,49 +292,18 @@ def ticker_meta(tickers: list[str]) -> dict:
         try:
             i = yf.Ticker(tk).info
             meta[tk] = {"name": i.get("longName") or i.get("shortName"), "type": i.get("quoteType"),
-                        "sector": i.get("sector"), "industry": i.get("industry")}
+                        "sector": i.get("sector"), "industry": i.get("industry"),
+                        "timing": "live", "live_fields": ["name", "type", "sector", "industry"]}
         except Exception:  # noqa: BLE001
-            meta[tk] = {"name": None, "type": None, "sector": None, "industry": None}
+            meta[tk] = {"name": None, "type": None, "sector": None, "industry": None, "timing": "live"}
     return meta
 
 
 def fred_snapshot(as_of: str) -> dict:
-    """Latest values of a few macro series via the project's own FRED vendor."""
-    try:
-        from tradingagents.dataflows.vendors import fred
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"fred vendor import failed: {e}"}
-    series = {"fed_funds": "FEDFUNDS", "10y_treasury": "DGS10", "2y_treasury": "DGS2",
-              "10y_2y_spread": "T10Y2Y", "vix": "VIXCLS", "core_cpi_index": "CPILFESL",
-              "unemployment": "UNRATE", "dollar_index": "DTWEXBGS"}
-    out = {}
-    as_of_dt = datetime.strptime(as_of, "%Y-%m-%d")
-    # 800 days so a lagged monthly print still has an observation ~365 days earlier (CPI YoY).
-    start = (as_of_dt - timedelta(days=FRED_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    for name, sid in series.items():
-        try:
-            data = fred._request("series/observations", {
-                "series_id": sid, "observation_start": start, "observation_end": as_of,
-                "sort_order": "desc", "limit": 900})
-            obs = [o for o in data.get("observations", []) if o.get("value") not in (".", None)]
-            if not obs:
-                continue
-            latest = obs[0]
-            age = (as_of_dt - datetime.strptime(latest["date"], "%Y-%m-%d")).days
-            limit = 45 if name in FRED_MONTHLY else 4
-            entry = {"date": latest["date"], "value": float(latest["value"]), "age_days": age,
-                     "stale": age > limit}
-            # value ~1 year earlier for context
-            target = (datetime.strptime(latest["date"], "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
-            older = [o for o in obs if o["date"] <= target]
-            if older:
-                entry["value_1y_ago"] = float(older[0]["value"])
-                if sid == "CPILFESL":
-                    entry["yoy_pct"] = round((entry["value"] / entry["value_1y_ago"] - 1) * 100, 2)
-            out[name] = entry
-        except Exception as e:  # noqa: BLE001
-            out[name] = {"error": str(e)[:160]}
-    return out
+    """Vintage-pinned FRED values from the shared macro panel."""
+    _addons_root()
+    import macro_panel
+    return macro_panel.fred_snapshot(as_of)
 
 
 # --------------------------------------------------------------------------- analytics
@@ -474,11 +478,13 @@ def _earnings_info(tk: str, today: date) -> dict:
             return {}
         future = sorted(d for d in dates if d >= today)
         if not future:
-            return {"last": max(dates).isoformat()}
+            return {"last": max(dates).isoformat(), "timing": "live", "as_of": today.isoformat(),
+                    "live_fields": ["last"]}
         nxt = future[0]
-        return {"date": nxt.isoformat(), "calendar_days": (nxt - today).days}
+        return {"date": nxt.isoformat(), "calendar_days": (nxt - today).days,
+                "timing": "live", "as_of": today.isoformat(), "live_fields": ["date", "calendar_days"]}
     except Exception as e:  # noqa: BLE001
-        return {"error": str(e)[:160]}
+        return {"error": str(e)[:160], "timing": "live", "as_of": today.isoformat()}
 
 
 def speaking_order(rnd: int, anchor: str) -> tuple[str, ...]:
@@ -672,10 +678,11 @@ def _apply_cli_overrides(plan: dict, args) -> dict:
 
 def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, targets: dict | None,
                 meta: dict, corr_threshold: float, watchlist: list[dict], reports: dict,
-                macro: dict | None, cash_policy: dict) -> dict:
+                macro: dict | None, cash_policy: dict, as_of: str | None = None) -> dict:
     positions = book["positions"]
     cash = float(book.get("cash", 0))
     tickers = [p["ticker"] for p in positions]
+    anchor = datetime.strptime(as_of, "%Y-%m-%d").date() if as_of else date.today()
 
     rows = []
     for p in positions:
@@ -734,7 +741,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
         r.update(per.get(r["ticker"], {}))
         kind = (r.get("type") or "").lower()
         if kind != "etf" and r["ticker"] != BENCH:
-            earn = _earnings_info(r["ticker"], date.today())
+            earn = _earnings_info(r["ticker"], anchor)
             if earn:
                 r["earnings"] = earn
                 if earn.get("calendar_days") is not None and earn["calendar_days"] <= RISK_POLICY["earnings_warn_days"]:
@@ -820,30 +827,32 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     if "^VIX" in close:
         vx = close["^VIX"].dropna()
         if len(vx):
-            age = (date.today() - vx.index[-1].date()).days
+            age = (anchor - vx.index[-1].date()).days
             regime["vix_yahoo"] = {"value": round(float(vx.iloc[-1]), 2), "date": str(vx.index[-1].date()),
-                                   "age_days": age, "source": "yfinance ^VIX", "stale": age > 4}
+                                   "as_of": anchor.isoformat(), "age_days": age, "source": "yfinance ^VIX",
+                                   "timing": "as_of", "stale": age > 4}
             if age > 4:
                 data_checks.append(f"^VIX is stale: {regime['vix_yahoo']['value']} on {regime['vix_yahoo']['date']} ({age} days)")
     if "^VIX3M" in close:
         v3 = close["^VIX3M"].dropna()
         if len(v3):
-            age = (date.today() - v3.index[-1].date()).days
+            age = (anchor - v3.index[-1].date()).days
             regime["vix3m_yahoo"] = {"value": round(float(v3.iloc[-1]), 2), "date": str(v3.index[-1].date()),
-                                     "age_days": age, "source": "yfinance ^VIX3M", "stale": age > 4}
+                                     "as_of": anchor.isoformat(), "age_days": age, "source": "yfinance ^VIX3M",
+                                     "timing": "as_of", "stale": age > 4}
     if macro:
         for k in ("vix", "10y_treasury", "2y_treasury", "10y_2y_spread", "fed_funds",
                   "core_cpi_index", "unemployment"):
             entry = macro.get(k)
             if isinstance(entry, dict) and "value" in entry:
-                regime[k] = {"value": entry["value"], "date": entry.get("date"),
+                regime[k] = {"value": entry["value"], "date": entry.get("date"), "as_of": entry.get("as_of") or anchor.isoformat(),
                              "age_days": entry.get("age_days"), "stale": bool(entry.get("stale"))}
                 if entry.get("yoy_pct") is not None:
                     regime[k]["yoy_pct"] = entry["yoy_pct"]
                 if entry.get("stale"):
                     data_checks.append(
                         f"{k} is stale: {entry['value']} as of {entry.get('date')} "
-                        f"({entry.get('age_days')} days before {date.today().isoformat()})")
+                        f"({entry.get('age_days')} days before {anchor.isoformat()})")
     ratings = {}
     for tk, rep in reports.items():
         ratings.setdefault(str(rep.get("pm_rating")), []).append(tk)
@@ -877,7 +886,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
         if tk in close:
             ent["atr_stop"] = _atr_stop(close[tk])
         if (ent.get("type") or "").lower() != "etf":
-            earn = _earnings_info(tk, date.today())
+            earn = _earnings_info(tk, anchor)
             if earn:
                 ent["earnings"] = earn
                 if earn.get("calendar_days") is not None and earn["calendar_days"] <= RISK_POLICY["earnings_warn_days"]:
@@ -1608,12 +1617,17 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
     if macro:
         L.append("\n### Macro (FRED)")
         for k, v in macro.items():
-            if "value" in v:
-                extra = f", 1y ago {v['value_1y_ago']}" if "value_1y_ago" in v else ""
-                extra += f", YoY {v['yoy_pct']}%" if "yoy_pct" in v else ""
-                extra += f", age {v['age_days']}d" if "age_days" in v else ""
-                extra += " STALE" if v.get("stale") else ""
-                L.append(f"- {k}: {v['value']} ({v['date']}{extra})")
+            if not isinstance(v, dict) or "value" not in v:
+                if k == "error":
+                    L.append(f"- FRED unavailable: {v}")
+                continue
+            extra = f", 1y ago {v['value_1y_ago']}" if "value_1y_ago" in v else ""
+            extra += f", YoY {v['yoy_pct']}%" if "yoy_pct" in v else ""
+            extra += f", as_of {v['as_of']}" if v.get("as_of") else ""
+            extra += f", vintage {v['vintage']}" if v.get("vintage") else ""
+            extra += f", age {v['age_days']}d" if "age_days" in v else ""
+            extra += " STALE" if v.get("stale") else ""
+            L.append(f"- {k}: {v['value']} ({v['date']}{extra})")
     L.append("\n## Appendix B - Source agent reports")
     for tk, r in reports.items():
         L.append(f"- {tk}: {r['pm_rating']} (trader {r['trader_action']}), analysis date {r['analysis_date']}, `logs/reports/{r['report_dir']}`")
@@ -1692,14 +1706,14 @@ def main() -> int:
     reports = {tk: parse_report(tk, found[tk], args.include_risk, args.max_report_chars) for tk in tickers + wl_tk if tk in found}
 
     log("downloading ~2y daily prices from yfinance ...")
-    close = fetch_prices_with_regime(tickers + wl_tk)
-    quotes = live_quotes(tickers + wl_tk, close)
+    close = fetch_prices_with_regime(tickers + wl_tk, args.date)
+    quotes = live_quotes(tickers + wl_tk, close, args.date)
     meta = ticker_meta(tickers)
     macro = None
     if not args.no_macro:
         log("FRED macro snapshot ...")
-        macro = fred_snapshot(datetime.now().strftime("%Y-%m-%d"))
-    stats = build_stats(book, close, quotes, themes, targets, meta, args.corr_threshold, watchlist, reports, macro, cash_policy)
+        macro = fred_snapshot(args.date)
+    stats = build_stats(book, close, quotes, themes, targets, meta, args.corr_threshold, watchlist, reports, macro, cash_policy, args.date)
     acct = stats["account"]
     log(f"account ${acct['total_value']:,.0f} (cash {acct['cash_pct']}%), vol {stats['risk']['portfolio_ann_vol_pct']}%, "
         f"beta {stats['risk']['portfolio_beta_spy_1y']} (1y) / {stats['risk']['portfolio_beta_spy_2y']} (2y)")

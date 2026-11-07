@@ -34,6 +34,7 @@ def main() -> int:
     assert by["AAA"]["rank"] == 1, ranked
     assert by["AAA"]["dist_ma50"] is not None and by["AAA"]["atr_pct"] is not None
     assert by["AAA"]["earnings_days"] == 3
+    assert by["AAA"]["earnings_timing"] == "live"
     assert by["AAA"]["score"] > by["BBB"]["score"]
 
     groups = ts.group_rs(close, {"leaders": ["AAA"], "laggards": ["BBB"]}, "SPY")
