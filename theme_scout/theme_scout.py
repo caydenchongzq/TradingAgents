@@ -14,7 +14,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -333,9 +332,141 @@ def av_headlines(as_of: str, limit: int = 12) -> list[dict]:
              "summary": (item.get("summary") or "")[:240]} for item in feed[:limit]]
 
 
+SHADOW_UNTIL = "2026-12-05"
+MAX_ADDS_PER_WEEK = 5
+MAX_DROPS_PER_WEEK = 5
+COOLDOWN_DAYS = 28
+
+
+def curator_policy(targets: dict | None) -> dict:
+    raw = (targets or {}).get("watchlist_curator") or {}
+    return {
+        "shadow_until": str(raw.get("shadow_until") or SHADOW_UNTIL),
+        "max_adds_per_week": int(raw.get("max_adds_per_week") or MAX_ADDS_PER_WEEK),
+        "max_drops_per_week": int(raw.get("max_drops_per_week") or MAX_DROPS_PER_WEEK),
+        "cooldown_days": int(raw.get("cooldown_days") or COOLDOWN_DAYS),
+        "shadow_forced_off": raw.get("shadow") is False,
+    }
+
+
+def staged_tickers(data_root: Path) -> set[str]:
+    """Tickers with a staged order in the newest fund-manager report."""
+    base = Path(data_root) / "fund_manager"
+    if not base.is_dir():
+        return set()
+    reports = [path for path in base.glob("*/*/portfolio_report.json") if path.is_file()]
+    if not reports:
+        return set()
+    latest = max(reports, key=lambda path: path.stat().st_mtime)
+    try:
+        data = json.loads(latest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    names = set()
+    for key in ("final", "draft"):
+        for trade in (data.get(key) or {}).get("trades") or []:
+            if str(trade.get("order_type") or "").lower() != "staged":
+                continue
+            try:
+                shares = int(trade.get("shares") or 0)
+            except (TypeError, ValueError):
+                shares = 0
+            ticker = str(trade.get("ticker") or "").upper()
+            if ticker and shares:
+                names.add(ticker)
+    return names
+
+
+def curator_shadow(as_of: str | None, targets: dict | None = None) -> bool:
+    """Proposals only through the shadow date. An explicit shadow false turns it off."""
+    policy = curator_policy(targets)
+    if policy["shadow_forced_off"]:
+        return False
+    day = as_of or date.today().isoformat()
+    return day <= policy["shadow_until"]
+
+
+def ai_weight_for(ticker: str, targets: dict | None, themes: dict | None) -> tuple[float, str]:
+    """Untagged names count as full AI exposure until someone sets a weight."""
+    sleeve = (targets or {}).get("ai_sleeve") or {}
+    ticker_weight = sleeve.get("ticker_weight") or {}
+    if ticker in ticker_weight:
+        return float(ticker_weight[ticker]), "ticker_weight"
+    theme_weight = sleeve.get("theme_weight") or {}
+    for name, members in ((themes or {}).get("themes") or {}).items():
+        if ticker in {str(member).upper() for member in members}:
+            if name in theme_weight:
+                return float(theme_weight[name]), "theme_weight"
+            # Tagged under a theme the AI sleeve does not count, such as sector_etf.
+            return 0.0, f"theme {name}"
+    return 1.0, "default_until_tagged"
+
+
+def book_ai_lookthrough(book: dict | None, close: pd.DataFrame, targets: dict | None,
+                        themes: dict | None) -> float | None:
+    """AI look-through % of the current book at the as-of close. Same weights as the fund manager.
+
+    A held name with no tag counts 0 here, as in the fund manager. Only new adds default to 1.0.
+    """
+    positions = (book or {}).get("positions") or []
+    cash = float((book or {}).get("cash") or 0)
+    sleeve = (targets or {}).get("ai_sleeve") or {}
+    tick = sleeve.get("ticker_weight") or {}
+    theme_w = sleeve.get("theme_weight") or {}
+    invested, ai = 0.0, 0.0
+    for pos in positions:
+        tk = str(pos.get("ticker") or "").upper()
+        qty = float(pos.get("quantity") or pos.get("shares") or 0)
+        if not tk or not qty:
+            continue
+        px = None
+        if close is not None and tk in close:
+            series = close[tk].dropna()
+            if len(series):
+                px = float(series.iloc[-1])
+        if px is None:
+            px = float(pos.get("average_price") or 0)
+        value = qty * px
+        invested += value
+        if tk in tick:
+            frac = float(tick[tk])
+        else:
+            frac = 0.0
+            for name, members in ((themes or {}).get("themes") or {}).items():
+                if tk in {str(m).upper() for m in members}:
+                    frac = float(theme_w.get(name, 0.0))
+                    break
+        ai += value * frac
+    total = invested + cash
+    if total <= 0:
+        return None
+    return round(ai / total * 100, 2)
+
+
 def apply_watchlist(items: list[dict], adds: list[dict], drops: list[dict],
-                    scores: dict[str, float], min_n: int = MIN_WATCH, max_n: int = MAX_WATCH) -> tuple[list[dict], list[dict]]:
-    """Apply proposed adds and drops, then keep the list inside min_n..max_n."""
+                    scores: dict[str, float], min_n: int = MIN_WATCH, max_n: int = MAX_WATCH, *,
+                    shadow: bool | None = None, as_of: str | None = None,
+                    holdings: set | None = None, staged: set | None = None,
+                    universe: set | None = None, log_events: list | None = None,
+                    targets: dict | None = None, themes: dict | None = None,
+                    ai_lookthrough_pct: float | None = None) -> tuple[list[dict], list[dict]]:
+    """Curate adds and drops. Shadow mode returns the proposal and does not imply a file write."""
+    policy = curator_policy(targets)
+    if shadow is None:
+        shadow = curator_shadow(as_of, targets)
+    held = {str(tk).upper() for tk in (holdings or set())}
+    staged_names = {str(tk).upper() for tk in (staged or set())}
+    allowed = {str(tk).upper() for tk in universe} if universe is not None else None
+    _addons()
+    import watchlist_log
+    events = list(log_events or [])
+    day = as_of or date.today().isoformat()
+    cooling = watchlist_log.cooldown_tickers(events, day, policy["cooldown_days"])
+    used = watchlist_log.week_counts(events, day)
+    adds_left = policy["max_adds_per_week"] - used["add"]
+    drops_left = policy["max_drops_per_week"] - used["drop"]
+    cap = float(((targets or {}).get("ai_sleeve") or {}).get("cap_pct") or 50)
+
     by, order, changes = {}, [], []
     for item in items:
         tk = str(item["ticker"]).upper()
@@ -346,15 +477,36 @@ def apply_watchlist(items: list[dict], adds: list[dict], drops: list[dict],
         by[tk] = row
         order.append(tk)
     fresh = set()
+
+    def _change(action: str, ticker: str, reason: str, **extra) -> None:
+        row = {"action": action, "ticker": ticker, "reason": reason, "shadow": bool(shadow), "applied": False}
+        row.update(extra)
+        changes.append(row)
+
     for add in adds or []:
         tk = str(add.get("ticker") or "").strip().upper()
         if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", tk or ""):
-            changes.append({"action": "skip_add", "ticker": tk, "reason": "invalid ticker"})
+            _change("skip_add", tk, "invalid ticker")
+            continue
+        if allowed is not None and tk not in allowed:
+            _change("skip_add", tk, "outside the universe")
             continue
         if tk in by:
-            changes.append({"action": "skip_add", "ticker": tk, "reason": "already on the watchlist"})
+            _change("skip_add", tk, "already on the watchlist")
             continue
-        row = {"ticker": tk, "sector": add.get("sector") or "Unclassified", "type": add.get("type") or "stock"}
+        if tk in cooling:
+            _change("skip_add", tk, f"cooldown of {policy['cooldown_days']} days after an add or drop")
+            continue
+        if adds_left <= 0:
+            _change("skip_add", tk, f"weekly add cap is {policy['max_adds_per_week']}")
+            continue
+        weight, source = ai_weight_for(tk, targets, themes)
+        if weight > 0 and ai_lookthrough_pct is not None and float(ai_lookthrough_pct) >= cap:
+            _change("skip_add", tk, f"AI sleeve {float(ai_lookthrough_pct):.1f}% is at the {cap:.0f}% cap; untagged names count as 1.0 until tagged",
+                    ai_weight=weight, ai_weight_source=source)
+            continue
+        row = {"ticker": tk, "sector": add.get("sector") or "Unclassified", "type": add.get("type") or "stock",
+               "ai_weight": weight, "ai_weight_source": source}
         if add.get("sub_theme"):
             row["sub_theme"] = add["sub_theme"]
         if add.get("reason"):
@@ -362,29 +514,95 @@ def apply_watchlist(items: list[dict], adds: list[dict], drops: list[dict],
         by[tk] = row
         order.append(tk)
         fresh.add(tk)
-        changes.append({"action": "add", "ticker": tk, "reason": add.get("reason") or ""})
+        adds_left -= 1
+        _change("add", tk, add.get("reason") or "", ai_weight=weight, ai_weight_source=source)
+
+    def _protected(tk: str) -> str | None:
+        if tk in held:
+            return "holding is never dropped; flagged trim"
+        if tk in staged_names:
+            return "staged order is never dropped; flagged trim"
+        return None
+
     for drop in drops or []:
         tk = str(drop.get("ticker") if isinstance(drop, dict) else drop or "").strip().upper()
         reason = drop.get("reason") if isinstance(drop, dict) else ""
         if tk not in by:
-            changes.append({"action": "skip_drop", "ticker": tk, "reason": "not on the watchlist"})
+            _change("skip_drop", tk, "not on the watchlist")
+            continue
+        why = _protected(tk)
+        if why:
+            _change("trim", tk, why if not reason else f"{why}. {reason}")
+            continue
+        if tk in cooling:
+            _change("skip_drop", tk, f"cooldown of {policy['cooldown_days']} days after an add or drop")
+            continue
+        if drops_left <= 0:
+            _change("skip_drop", tk, f"weekly drop cap is {policy['max_drops_per_week']}")
             continue
         if len(by) - 1 < min_n:
-            changes.append({"action": "kept", "ticker": tk, "reason": f"dropping would put the list under {min_n}"})
+            _change("kept", tk, f"dropping would put the list under {min_n}")
             continue
         by.pop(tk)
         order = [t for t in order if t != tk]
-        changes.append({"action": "drop", "ticker": tk, "reason": reason})
-    while len(by) > max_n:
-        pool = [tk for tk in by if tk not in fresh] or list(by)
+        drops_left -= 1
+        _change("drop", tk, reason)
+    while len(by) > max_n and drops_left > 0:
+        pool = [tk for tk in by if tk not in fresh and not _protected(tk)]
+        if not pool:
+            _change("kept", "", f"list is over {max_n} but the remaining names are holdings or staged orders")
+            break
         victim = min(pool, key=lambda tk: scores.get(tk, -1e9))
         by.pop(victim)
         fresh.discard(victim)
         order = [t for t in order if t != victim]
-        changes.append({"action": "trim", "ticker": victim, "reason": f"watchlist cap is {max_n}"})
+        drops_left -= 1
+        _change("trim", victim, f"watchlist cap is {max_n}")
+    if len(by) > max_n:
+        _change("kept", "", f"list has {len(by)} names and the weekly drop cap blocks further trims")
     if len(by) < min_n:
-        changes.append({"action": "short", "ticker": "", "reason": f"{len(by)} names is under the {min_n} floor. Nothing was invented to fill it."})
-    return [by[tk] for tk in order if tk in by], changes
+        _change("short", "", f"{len(by)} names is under the {min_n} floor. Nothing was invented to fill it.")
+    proposed = [by[tk] for tk in order if tk in by]
+    if shadow:
+        _change("shadow", "", f"shadow mode until {policy['shadow_until']}; proposals only, watchlist not edited")
+        return proposed, changes
+    for change in changes:
+        if change["action"] in {"add", "drop", "trim"}:
+            change["applied"] = True
+    return proposed, changes
+
+
+def commit_watchlist(path: Path, current: list[dict], proposed: list[dict], changes: list[dict],
+                     proposals_path: Path, data_root: Path, as_of: str) -> str:
+    """Write a proposals file in shadow mode. Otherwise write the watchlist and append the log. No backup file."""
+    _addons()
+    import watchlist_log
+    shadow = any(change.get("shadow") for change in changes)
+    real = [change for change in changes if change.get("action") in {"add", "drop", "trim"}]
+    if shadow:
+        proposals_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"date": as_of, "shadow": True, "changes": changes, "proposed": proposed,
+                   "watchlist_size": len(current)}
+        proposals_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return "proposal"
+    if not real:
+        return "none"
+    path.write_text(json.dumps(proposed, indent=2) + "\n", encoding="utf-8")
+    by_ticker = {str(item.get("ticker") or "").upper(): item for item in current}
+    for change in changes:
+        if change.get("action") not in {"add", "drop"}:
+            continue
+        ticker = str(change.get("ticker") or "").upper()
+        watchlist_log.append_event(data_root, {
+            "as_of": as_of,
+            "action": change["action"],
+            "ticker": ticker,
+            "reason": change.get("reason") or "",
+            "source": "scout",
+            "row": by_ticker.get(ticker) if change["action"] == "drop" else next(
+                (row for row in proposed if row.get("ticker") == ticker), {"ticker": ticker}),
+        })
+    return "written"
 
 
 def tier_candidates(holdings: list[str], ranked: list[dict], n: int) -> list[str]:
@@ -506,9 +724,10 @@ ahead of a weak one. Put every shown ticker in `ranking` exactly once, with rank
 Mark a holding you would keep `keep` and a weak holding you would sell down `trim`. Mark a candidate you
 would buy `add` and one you would not `pass`. Do not answer with new-name ideas only.
 Also mark each listed theme overweight, neutral, or avoid. You may propose watchlist adds and drops so the
-list stays between 30 and 50 names. Do not invent tickers you were not shown unless they are liquid US
-listings you name explicitly. Prefer dropping weak relative-strength names over adding lookalikes. This is
-research support, not an order."""
+list stays between 30 and 50 names. Only use tickers that appear in `names` or `screen`. Do not invent a
+ticker, a listing, or a symbol that was not shown. Proposed adds must be tickers from that universe.
+Proposed drops must already be on the watchlist. Never drop a holding; mark it trim. Prefer dropping weak
+relative-strength names over adding lookalikes. This is research support, not an order."""
 
 
 def agent_plan_from_config() -> dict:
@@ -780,18 +999,29 @@ def main() -> int:
             payload["watchlist_size"] = len(watch)
             log("watchlist left unchanged")
         else:
-            updated, changes = apply_watchlist(watch, parsed.get("add") or [], parsed.get("drop") or [], scores)
+            _addons()
+            import watchlist_log
+            targets = load_json(root / "targets.json", {}) or {}
+            staged = staged_tickers(root)
+            universe = set(holdings) | {w["ticker"] for w in watch} | set(SECTORS) | {"SPY"}
+            shadow = curator_shadow(args.date, targets)
+            updated, changes = apply_watchlist(
+                watch, parsed.get("add") or [], parsed.get("drop") or [], scores,
+                shadow=shadow, as_of=args.date, holdings=set(holdings), staged=staged,
+                universe=universe, log_events=watchlist_log.read_events(root),
+                targets=targets, themes=themes,
+                ai_lookthrough_pct=book_ai_lookthrough(book, close, targets, themes))
             payload["changes"] = changes
-            payload["watchlist_size"] = len(updated)
-            if changes and watch_path.exists():
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup = watch_path.with_name(watch_path.name + f".bak_{stamp}")
-                shutil.copy2(watch_path, backup)
-                payload["watchlist_backup"] = str(backup)
-                watch_path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
-                log(f"watchlist updated ({len(watch)} -> {len(updated)}); backup {backup.name}")
+            payload["watchlist_size"] = len(watch if shadow else updated)
+            proposals = out_dir / "watchlist_proposals.json"
+            outcome = commit_watchlist(watch_path, watch, updated, changes, proposals, root, args.date)
+            if outcome == "proposal":
+                log(f"shadow mode: proposals at {proposals.name}; watchlist not edited")
+            elif outcome == "written":
+                payload["watchlist_size"] = len(updated)
+                log(f"watchlist updated ({len(watch)} -> {len(updated)})")
             elif changes:
-                log("changes were computed but the watchlist file is missing, so nothing was written")
+                log("no watchlist edit")
         top = [row["ticker"] for row in ordered if row["bucket"] == "candidate"][: args.tier_n]
         payload["top_non_holdings"] = top
         print("TOP_NON_HOLDINGS=" + ",".join(top))

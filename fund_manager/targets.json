@@ -4,6 +4,7 @@
   "cash_policy": { "min_pct": 5, "max_pct": 35, "soft_default_pct": 12 },
   "weekly_budget_usd": 25,
   "budget": { "weekly_usd": 25, "native_run_estimate_usd": 2, "fund_manager_estimate_usd": 1.5 },
+  "watchlist_curator": { "shadow": true, "shadow_until": "2026-12-05", "max_adds_per_week": 5, "max_drops_per_week": 5, "cooldown_days": 28 },
   "ai_sleeve": {
     "cap_pct": 50,
     "as_of": "2026-11-05",
