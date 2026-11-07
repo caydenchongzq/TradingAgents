@@ -549,8 +549,7 @@ def _without_opus(model: str, allow_opus: bool, seat: str) -> str:
     """Opus on a non-conservative seat is a warning, not a substitution."""
     if not opus_on_other_seat(model, seat) or allow_opus:
         return model
-    log(f"warning: {seat} uses {model}. Opus stays locked on the conservative seat; "
-        "this choice is allowed and is not blocked.")
+    log(f"warning: {seat} uses {model}. Opus on this seat is allowed and is not blocked.")
     return model
 
 
@@ -582,8 +581,6 @@ def agent_plan_from_config() -> dict:
             "max_tokens": seat.get("max_tokens") or builtin_tokens,
             "temperature": seat.get("temperature"),
             "system": seat.get("system") or builtin_system,
-            "locked": bool(seat.get("locked")),
-            "unlocked": bool(seat.get("unlocked")),
         }
     _separate_neutral(plan)
     return plan
@@ -611,11 +608,7 @@ def _apply_cli_overrides(plan: dict, args) -> dict:
     for seat_id, (model_attr, effort_attr, tokens_attr) in mapping.items():
         spec = plan[seat_id]
         cli_model = getattr(args, model_attr)
-        if spec["locked"] and not spec["unlocked"]:
-            if cli_model and cli_model != CONSERVATIVE_MODEL:
-                log(f"{seat_id} stays on {CONSERVATIVE_MODEL}. Unlock it in Argus to change the model.")
-            spec["model"] = CONSERVATIVE_MODEL
-        elif cli_model:
+        if cli_model:
             spec["model"] = cli_model
         cli_effort = getattr(args, effort_attr)
         if cli_effort:
@@ -1556,7 +1549,7 @@ def main() -> int:
     ap.add_argument("--neutral-model", default=None,
                     help="must differ from the fund manager; omit to use agent_config.json")
     ap.add_argument("--conservative-model", default=None,
-                    help="ignored while the conservative seat is locked to anthropic/claude-opus-5.5")
+                    help="conservative risk model; omit to use addons/agent_config.json")
     ap.add_argument("--allow-opus", action="store_true",
                     help="also permit an Opus model on the fund manager, aggressive, or neutral seat")
     ap.add_argument("--risk-rounds", type=int, default=1, help="risk committee rounds (0 = no debate)")
@@ -1635,8 +1628,8 @@ def main() -> int:
     models = {"fm": args.model, "aggressive": args.aggressive_model, "conservative": args.conservative_model,
               "neutral": args.neutral_model,
               "note": "Models, effort, and system prompts come from addons/agent_config.json. "
-                      "The conservative seat is locked to anthropic/claude-opus-5.5 until it is unlocked in Argus. "
-                      "Opus on any other seat is a warning, not a block. Neutral is kept different from the fund manager."}
+                      "Every seat uses the model saved in that file, including conservative. "
+                      "Opus on a non-conservative seat is a warning, not a block. Neutral is kept different from the fund manager."}
     eff = lambda e: None if e in (None, "none") else e  # noqa: E731
     calls, draft, debate, final, check_d, check_f = [], None, [], None, None, None
     if not args.no_llm:

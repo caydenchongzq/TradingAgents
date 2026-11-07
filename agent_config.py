@@ -294,7 +294,7 @@ def catalog() -> dict[str, dict]:
         tokens = _EST_TOKENS.get(seat["id"])
         seat["est_input_tokens"] = tokens[0] if tokens else None
         seat["est_output_tokens"] = tokens[1] if tokens else None
-        seat["locked"] = seat["id"] in CONSERVATIVE_SEATS
+        seat["locked"] = False
         out[seat["id"]] = seat
     _CATALOG = out
     return out
@@ -313,15 +313,14 @@ def load_models() -> dict:
 def load_overrides() -> dict:
     path = config_path()
     if not path.is_file():
-        return {"seats": {}, "unlocked": []}
+        return {"seats": {}}
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise AgentConfigError("agent_config.json must be an object")
     seats = data.get("seats") or {}
-    unlocked = data.get("unlocked") or []
-    if not isinstance(seats, dict) or not isinstance(unlocked, list):
-        raise AgentConfigError("agent_config.json seats/unlocked are the wrong type")
-    return {"seats": seats, "unlocked": [str(x) for x in unlocked]}
+    if not isinstance(seats, dict):
+        raise AgentConfigError("agent_config.json seats must be an object")
+    return {"seats": seats}
 
 
 def _model_row(model_id: str, models: list[dict]) -> dict | None:
@@ -346,7 +345,7 @@ def estimate_cost(seat: dict, model_row: dict | None) -> float | None:
 def opus_warning(model: str, seat_id: str) -> str | None:
     if seat_id in CONSERVATIVE_SEATS or "opus" not in (model or "").lower():
         return None
-    return f"{seat_id} uses {model}. Opus is locked to the conservative seats; this choice is allowed and is not blocked."
+    return f"{seat_id} uses {model}. Opus on this seat is allowed and is not blocked."
 
 
 def resolved_seat(seat_id: str) -> dict:
@@ -357,7 +356,6 @@ def resolved_seat(seat_id: str) -> dict:
     over = saved["seats"].get(seat_id) or {}
     if not isinstance(over, dict):
         over = {}
-    unlocked = seat_id in saved["unlocked"]
     seat = dict(base)
     for key in ("model", "effort", "temperature", "max_tokens", "system"):
         if key in over:
@@ -366,9 +364,8 @@ def resolved_seat(seat_id: str) -> dict:
     seat["default_model"] = base["model"]
     seat["default_effort"] = base["effort"]
     seat["default_max_tokens"] = base["max_tokens"]
-    seat["unlocked"] = bool(unlocked)
-    if seat["locked"] and not unlocked:
-        seat["model"] = LOCKED_MODEL
+    seat["unlocked"] = False
+    seat["locked"] = False
     models = load_models().get("models") or []
     seat["opus_warning"] = opus_warning(str(seat.get("model") or ""), seat_id)
     seat["est_cost_usd"] = estimate_cost(seat, _model_row(str(seat.get("model") or ""), models))
@@ -402,8 +399,8 @@ def public_payload() -> dict:
     return {
         "models": models.get("models") or [],
         "pricing_note": models.get("pricing_note") or "",
-        "locked_model": LOCKED_MODEL,
-        "lock_note": "The risk conservative seat stays on anthropic/claude-opus-5.5. Unlock confirms a change for the next run.",
+        "locked_model": None,
+        "lock_note": "",
         "seats": seats,
         "warnings": warnings,
         "path": str(config_path()),
@@ -470,24 +467,17 @@ def _clean_system(value: str) -> str:
 
 
 def validate_and_save(incoming: dict) -> dict:
-    """Persist overrides. Conservative seats stay on Opus unless unlock lists them."""
+    """Persist overrides. Every seat, including conservative, keeps the model it is given."""
     if not isinstance(incoming, dict):
         raise AgentConfigError("Body must be an object")
     seats_in = incoming.get("seats")
     if not isinstance(seats_in, dict):
         raise AgentConfigError("seats must be an object")
-    unlock = incoming.get("unlock") or []
-    if not isinstance(unlock, list) or any(not isinstance(x, str) for x in unlock):
-        raise AgentConfigError("unlock must be a list of seat ids")
-    unknown_unlock = [x for x in unlock if x not in CONSERVATIVE_SEATS]
-    if unknown_unlock:
-        raise AgentConfigError("Only the conservative seats can be unlocked")
     known = catalog()
     extra = [k for k in seats_in if k not in known]
     if extra:
         raise AgentConfigError("Unknown seat: " + ", ".join(sorted(extra)))
     overrides: dict[str, dict] = {}
-    unlocked: list[str] = []
     for seat_id, base in known.items():
         raw = seats_in.get(seat_id)
         if raw is None:
@@ -505,12 +495,6 @@ def validate_and_save(incoming: dict) -> dict:
         if max_tokens is None:
             max_tokens = base["max_tokens"]
         system = _clean_system(raw.get("system") if raw.get("system") is not None else base["system"])
-        if base["locked"] and model != LOCKED_MODEL and seat_id not in unlock:
-            raise AgentConfigError(
-                f"{seat_id} is locked to {LOCKED_MODEL}. Confirm unlock before changing it."
-            )
-        if base["locked"] and model != LOCKED_MODEL:
-            unlocked.append(seat_id)
         diff = {}
         if model != base["model"]:
             diff["model"] = model
@@ -524,7 +508,7 @@ def validate_and_save(incoming: dict) -> dict:
             diff["system"] = system
         if diff:
             overrides[seat_id] = diff
-    payload = {"seats": overrides, "unlocked": unlocked}
+    payload = {"seats": overrides}
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
@@ -583,11 +567,10 @@ def dry_run_text() -> str:
     for seat in resolved_seats():
         cost = seat.get("est_cost_usd")
         cost_s = f"${cost:.4f}" if isinstance(cost, float) else "omitted"
-        lock = " locked" if seat["locked"] and not seat["unlocked"] else ""
         lines.append(
             f"{seat['id']}: model={seat['model']} effort={seat['effort']} "
             f"temperature={seat['temperature']} max_tokens={seat['max_tokens']} "
-            f"prompt_chars={len(seat['system'] or '')} est_cost={cost_s}{lock}"
+            f"prompt_chars={len(seat['system'] or '')} est_cost={cost_s}"
         )
         if seat.get("opus_warning"):
             lines.append("  warning: " + seat["opus_warning"])
@@ -751,10 +734,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         bits = ", ".join(f"{k}={v.get('model')}" for k, v in plan.items())
         print(f"{mod_name} loaded: {bits}")
-    locked = resolved_seat("fm_conservative")["model"] == LOCKED_MODEL
-    locked = locked and resolved_seat("risk_conservative")["model"] == LOCKED_MODEL
-    print("conservative locked:", "yes" if locked else "NO")
-    return 0 if locked else 1
+    fm_model = resolved_seat("fm_conservative")["model"]
+    risk_model = resolved_seat("risk_conservative")["model"]
+    print(f"conservative models: fund={fm_model} per-ticker={risk_model}")
+    return 0
 
 
 if __name__ == "__main__":

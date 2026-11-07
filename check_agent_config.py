@@ -27,7 +27,9 @@ def main() -> int:
         assert seat_id in seats, seat_id
         assert seats[seat_id]["system"].strip(), seat_id
     assert seats["fm_conservative"]["model"] == ac.LOCKED_MODEL
-    assert seats["risk_conservative"]["locked"] and not seats["risk_conservative"]["unlocked"]
+    assert seats["risk_conservative"]["model"] == ac.LOCKED_MODEL
+    assert not seats["risk_conservative"]["locked"]
+    assert not seats["fm_conservative"]["locked"]
     assert seats["fm_manager"]["est_cost_usd"] is not None
     assert seats["market"]["est_cost_usd"] is None
     assert ac.opus_warning("anthropic/claude-opus-5.5", "market")
@@ -40,16 +42,7 @@ def main() -> int:
         path = Path(tmp) / "agent_config.json"
         os.environ["ARGUS_AGENT_CONFIG"] = str(path)
         try:
-            try:
-                ac.validate_and_save({
-                    "unlock": [],
-                    "seats": {"fm_conservative": {"model": "openai/gpt-6-luna", "system": seats["fm_conservative"]["system"]}},
-                })
-                raise AssertionError("locked seat accepted a new model")
-            except ac.AgentConfigError:
-                pass
             saved = ac.validate_and_save({
-                "unlock": ["fm_conservative"],
                 "seats": {"fm_conservative": {
                     "model": "openai/gpt-6-luna",
                     "effort": "low",
@@ -59,9 +52,12 @@ def main() -> int:
             assert saved["seats"]
             got = {s["id"]: s for s in saved["seats"]}
             assert got["fm_conservative"]["model"] == "openai/gpt-6-luna"
-            assert got["fm_conservative"]["opus_warning"] is None
+            assert not got["fm_conservative"]["locked"]
+            assert fm.agent_plan_from_config()["fm_conservative"]["model"] == "openai/gpt-6-luna"
             on_disk = json.loads(path.read_text(encoding="utf-8"))
+            assert "unlocked" not in on_disk
             assert "fm_conservative" in on_disk["seats"]
+            assert on_disk["seats"]["fm_conservative"]["model"] == "openai/gpt-6-luna"
             assert list(path.parent.glob("*.bak")) == []
             rewritten = ac.apply_system_prompt("bull", original)
             # bull was not overridden, so the prompt is unchanged
