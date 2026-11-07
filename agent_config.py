@@ -597,15 +597,28 @@ _NATIVE_FACTORIES = {
 }
 
 
-class _SeatCall:
-    """Delegates to a seat client and rewrites the role text on each call."""
+try:
+    from langchain_core.runnables import Runnable as _Runnable
+except Exception:  # pragma: no cover - Argus imports this module without LangChain
+    _Runnable = object
+
+
+class _SeatCall(_Runnable):
+    """Delegates to a seat client and rewrites the role text on each call.
+
+    Analysts build ``prompt | llm.bind_tools(...)``. The object on the right
+    has to be a LangChain Runnable, so every binder returns another _SeatCall.
+    """
 
     def __init__(self, seat_id: str, inner):
         self.seat_id = seat_id
         self.inner = inner
 
-    def invoke(self, payload, *args, **kwargs):
-        return self.inner.invoke(apply_messages(self.seat_id, payload), *args, **kwargs)
+    def invoke(self, input, config=None, **kwargs):
+        payload = apply_messages(self.seat_id, input)
+        if config is None:
+            return self.inner.invoke(payload, **kwargs)
+        return self.inner.invoke(payload, config, **kwargs)
 
     def bind_tools(self, tools, **kwargs):
         return _SeatCall(self.seat_id, self.inner.bind_tools(tools, **kwargs))
@@ -613,8 +626,57 @@ class _SeatCall:
     def bind(self, **kwargs):
         return _SeatCall(self.seat_id, self.inner.bind(**kwargs))
 
+    def with_structured_output(self, schema, **kwargs):
+        return _SeatCall(self.seat_id, self.inner.with_structured_output(schema, **kwargs))
+
     def __getattr__(self, name):
         return getattr(self.inner, name)
+
+
+def check_seat_pipe(required: bool = False) -> str:
+    """Build ``prompt | seat.bind_tools([tool])`` without calling a model."""
+    try:
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.runnables import Runnable
+    except ImportError:
+        if required:
+            raise
+        return "skipped"
+    if not issubclass(_SeatCall, Runnable):
+        raise AssertionError("_SeatCall is not a LangChain Runnable")
+
+    class _Fake(Runnable):
+        def invoke(self, input, config=None, **kwargs):
+            raise AssertionError("model was called")
+
+        def bind_tools(self, tools, **kwargs):
+            nxt = _Fake()
+            nxt.kind = "tools"
+            return nxt
+
+        def bind(self, **kwargs):
+            nxt = _Fake()
+            nxt.kind = "bind"
+            return nxt
+
+        def with_structured_output(self, schema, **kwargs):
+            nxt = _Fake()
+            nxt.kind = "structured"
+            return nxt
+
+    tool = {"type": "function", "function": {"name": "ping", "description": "ping", "parameters": {"type": "object", "properties": {}}}}
+    wrapped = _SeatCall("market", _Fake())
+    bound = wrapped.bind_tools([tool])
+    if not isinstance(bound, Runnable):
+        raise AssertionError("bind_tools did not return a Runnable")
+    prompt = ChatPromptTemplate.from_template("Look at {ticker}")
+    piped = prompt | bound
+    plain = prompt | wrapped
+    structured = wrapped.with_structured_output({"type": "object"})
+    rebound = wrapped.bind(temperature=0)
+    if not all(isinstance(item, Runnable) for item in (piped, plain, structured, rebound)):
+        raise AssertionError("a seat binder was not a Runnable")
+    return "ok"
 
 
 def _fallback_model_name(llm) -> str:

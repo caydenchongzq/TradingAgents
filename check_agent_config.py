@@ -100,7 +100,10 @@ def main() -> int:
     assert "theme scout" in scout["system"]
     text = ac.dry_run_text()
     assert "no LLM calls" in text and "fm_conservative" in text
+    pipe = ac.check_seat_pipe()
+    assert pipe in ("ok", "skipped"), pipe
     print("check_agent_config: ok")
+    print(f"  seat pipe {pipe}")
     print(f"  seats {len(seats)} fm cost {seats['fm_manager']['est_cost_usd']}")
     return 0
 
