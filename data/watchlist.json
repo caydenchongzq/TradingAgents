@@ -2,7 +2,9 @@
   {
     "ticker": "XLV",
     "sector": "Health Care",
-    "type": "etf"
+    "type": "etf",
+    "theme": "sector_etf",
+    "note": "Health care sector ETF. Non-AI. Core ETF sleeve, held weeks to months."
   },
   {
     "ticker": "LLY",
@@ -22,7 +24,9 @@
   {
     "ticker": "XLP",
     "sector": "Consumer Staples",
-    "type": "etf"
+    "type": "etf",
+    "theme": "sector_etf",
+    "note": "Consumer staples sector ETF. Non-AI. Core ETF sleeve, held weeks to months."
   },
   {
     "ticker": "WMT",
@@ -62,7 +66,9 @@
   {
     "ticker": "XLE",
     "sector": "Energy",
-    "type": "etf"
+    "type": "etf",
+    "theme": "sector_etf",
+    "note": "Energy sector ETF. Non-AI. Core ETF sleeve, held weeks to months."
   },
   {
     "ticker": "XOM",
@@ -77,7 +83,9 @@
   {
     "ticker": "XLF",
     "sector": "Financials",
-    "type": "etf"
+    "type": "etf",
+    "theme": "sector_etf",
+    "note": "Financials sector ETF. Non-AI. Core ETF sleeve, held weeks to months."
   },
   {
     "ticker": "JPM",
@@ -92,7 +100,9 @@
   {
     "ticker": "GLD",
     "sector": "Gold",
-    "type": "etf"
+    "type": "etf",
+    "theme": "sector_etf",
+    "note": "Gold ETF. Non-AI. Core ETF sleeve, held weeks to months."
   },
   {
     "ticker": "TLT",
@@ -248,5 +258,27 @@
     "theme": "ai_growth",
     "sub_theme": "ai_cloud_software",
     "note": "Unity Software. NYSE."
+  },
+  {
+    "ticker": "QQQ",
+    "sector": "Nasdaq-100",
+    "type": "etf",
+    "theme": "core_index",
+    "note": "Invesco QQQ. AI look-through about 50%, same idea as SPY at 33%. Not a full ai_growth member."
+  },
+  {
+    "ticker": "SMH",
+    "sector": "Semiconductors",
+    "type": "etf",
+    "theme": "ai_growth",
+    "sub_theme": "ai_compute_semis",
+    "note": "VanEck Semiconductor ETF. About 100% AI compute and semis look-through."
+  },
+  {
+    "ticker": "IWM",
+    "sector": "US small cap",
+    "type": "etf",
+    "theme": "core_index",
+    "note": "iShares Russell 2000. Non-AI. Core ETF sleeve, held weeks to months."
   }
 ]
