@@ -588,6 +588,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
             data_checks.append(f"{tk}: no price history from yfinance")
             continue
         s1 = win1[tk].dropna()
+        # obs_1y is the 1y estimation sample (vol, beta). Total history is history_bars.
         ent = {"ann_vol_pct": round(float(s1.std() * math.sqrt(TRADING_DAYS) * 100), 1), "obs_1y": int(len(s1))}
         if bench1 is not None:
             s2 = win2[tk].dropna()
@@ -1020,14 +1021,22 @@ def _beta_of(info: dict) -> tuple[float, str]:
     return 1.0, "assumed 1.0 (no beta)"
 
 
+def _history_bars(info: dict) -> int | None:
+    """Total price bars. obs_1y is the 1-year estimation sample and is not a substitute."""
+    raw = info.get("history_bars")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+        return None
+    return int(raw)
+
+
 def _position_cap(info: dict, policy: dict) -> tuple[float, str]:
     theme = info.get("theme")
     kind = (info.get("type") or "").lower()
     if theme == "core_index" or (kind == "etf" and info.get("ticker") in (None, BENCH)) or info.get("ticker") == BENCH:
         return policy["broad_index_cap_pct"], "broad index"
-    obs = info.get("obs_1y") or info.get("history_bars") or 0
-    if obs and obs < policy["short_history_bars"]:
-        return policy["short_history_cap_pct"], f"history {obs} bars"
+    bars = _history_bars(info)
+    if bars is not None and bars < policy["short_history_bars"]:
+        return policy["short_history_cap_pct"], f"history {bars} bars"
     vol = info.get("ann_vol_pct")
     if isinstance(vol, (int, float)) and vol > policy["high_vol_threshold_pct"]:
         return policy["high_vol_cap_pct"], f"vol {vol}%"

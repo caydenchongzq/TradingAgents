@@ -119,6 +119,43 @@ def main() -> int:
     assert spy["downside_source"] == "plan"
     nvda = next(a for a in check["post_trade"] if a["ticker"] == "NVDA")
     assert nvda["downside_source"] == "atr_fallback"
+
+    # 248 is the 1y estimation sample. Short-history caps read total history_bars.
+    established = {"ticker": "MSFT", "type": "EQUITY", "ann_vol_pct": 22,
+                   "obs_1y": 248, "history_bars": 501}
+    cap, why = fm._position_cap(established, fm.RISK_POLICY)
+    assert cap == fm.RISK_POLICY["single_stock_cap_pct"] and "248" not in why, (cap, why)
+    missing_total = {"ticker": "MSFT", "type": "EQUITY", "ann_vol_pct": 22, "obs_1y": 248}
+    cap, why = fm._position_cap(missing_total, fm.RISK_POLICY)
+    assert cap == fm.RISK_POLICY["single_stock_cap_pct"] and "248" not in why, (cap, why)
+    spcx = {"ticker": "SPCX", "type": "EQUITY", "ann_vol_pct": 40, "obs_1y": 101, "history_bars": 103}
+    cap, why = fm._position_cap(spcx, fm.RISK_POLICY)
+    assert cap == fm.RISK_POLICY["short_history_cap_pct"] and why == "history 103 bars", (cap, why)
+    hist = _stats()
+    hist["positions"] = [
+        {"ticker": "MSFT", "quantity": 10, "price": 500, "theme": "megacap_quality",
+         "ann_vol_pct": 22, "obs_1y": 248, "history_bars": 501, "stress_beta": 1.1,
+         "atr_stop": 450, "type": "EQUITY"},
+        {"ticker": "SPCX", "quantity": 30, "price": 100, "theme": "ai_growth",
+         "ann_vol_pct": 40, "obs_1y": 101, "history_bars": 103, "stress_beta": 1.5,
+         "atr_stop": 80, "type": "EQUITY"},
+    ]
+    hist_decision = {
+        "cash_decision": {"target_cash_pct": 20},
+        "levels": [
+            {"ticker": "MSFT", "stop_or_reassess": 450},
+            {"ticker": "SPCX", "stop_or_reassess": 80},
+        ],
+        "trades": [
+            {"ticker": "MSFT", "action": "HOLD", "shares": 0, "decision": "keep"},
+            {"ticker": "SPCX", "action": "HOLD", "shares": 0, "decision": "keep"},
+        ],
+    }
+    hist_check = fm.validate_trades(hist_decision, hist)
+    hist_text = " ".join(hist_check["warnings"])
+    assert "history 248" not in hist_text, hist_text
+    assert "MSFT: post-trade weight" not in hist_text, hist_text
+    assert "SPCX: post-trade weight 3.0% exceeds the 2% cap (history 103 bars)" in hist_text, hist_text
     bad = fm.pd.DataFrame({
         "Date": ["2026-11-04 00:00:00-05:00", "2026-11-05 00:00:00-04:00"],
         "Close": [200.0, None],
