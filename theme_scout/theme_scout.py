@@ -582,6 +582,13 @@ def call_scout(model: str, context: str, system: str | None = None, max_tokens: 
     resp = client.chat.completions.create(**kwargs)
     content = resp.choices[0].message.content or "{}"
     usage = resp.usage.model_dump() if resp.usage else {}
+    try:
+        _addons()
+        import cost_ledger
+        root = Path(os.getenv("FM_DATA_ROOT", str(DATA_ROOT)))
+        cost_ledger.write_chat_cost(root, label="theme_scout", model=model, usage=usage)
+    except Exception as exc:  # noqa: BLE001
+        log("cost file skipped: " + _safe(exc))
     return {"parsed": json.loads(content), "model": model, "seconds": round(time.time() - t0, 1), "usage": usage}
 
 

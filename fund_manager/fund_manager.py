@@ -1124,6 +1124,12 @@ def call_llm(model: str, system: str, user: str, schema: dict, name: str, max_to
                    "seconds": round(time.time() - t0, 1), "model": getattr(resp, "model", model)}
             log(f"  {label}: {model} done in {out['seconds']}s ({mode}), tokens {usage.get('prompt_tokens')}/"
                 f"{usage.get('completion_tokens')}, cost {usage.get('cost', 'n/a')}")
+            try:
+                _addons_root()
+                import cost_ledger
+                cost_ledger.write_chat_cost(DATA_ROOT, label=label, model=out["model"], usage=usage)
+            except Exception as cost_exc:  # noqa: BLE001
+                log(f"  cost file skipped: {str(cost_exc)[:160]}")
             return out
         except Exception as e:  # noqa: BLE001
             last_err = e

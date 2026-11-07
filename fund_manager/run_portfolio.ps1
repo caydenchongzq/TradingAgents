@@ -138,12 +138,32 @@ if ($Tiered) {
   Write-Host ("Tier candidates: " + ($(if ($tierCandidates.Count) { $tierCandidates -join ", " } else { "(none)" }))) -ForegroundColor Green
 }
 
+function Test-WeeklyBudget([string]$Kind) {
+  # Free check. Stops before a paid run that would take the week over targets.json budget.weekly_usd.
+  $addons = (Resolve-Path (Join-Path $AddonDir "..")).Path
+  $ledger = Join-Path $addons "cost_ledger.py"
+  if (Get-Command py -ErrorAction SilentlyContinue) {
+    & py -3 $ledger --data-root $DataDir --date $AnalysisDate --kind $Kind
+  } else {
+    & python $ledger --data-root $DataDir --date $AnalysisDate --kind $Kind
+  }
+  if ($LASTEXITCODE -eq 4) {
+    Write-Error "Weekly budget would be exceeded ($Kind). No further paid run was started."
+    exit 4
+  }
+  if ($LASTEXITCODE -ne 0) {
+    Write-Error "Weekly budget check failed (exit $LASTEXITCODE)."
+    exit $LASTEXITCODE
+  }
+}
+
 function Invoke-NativeRun([string[]]$list, [string]$kind) {
   # Uses add-on wrapper so news_data = yfinance,alpha_vantage without editing project source.
   $failed = @()
   $i = 0
   foreach ($t in $list) {
     $i++
+    Test-WeeklyBudget "native"
     Write-Host "[$kind $i/$($list.Count)] TradingAgents $t ($AnalysisDate) [news: yfinance,alpha_vantage] ..." -ForegroundColor Cyan
     Invoke-TaPython @("/home/appuser/addon/run_native.py", "--ticker", $t, "--date", $AnalysisDate, "--analysts", $Analysts,
       "--portfolio", "/home/appuser/.tradingagents/my_book.json", "--save", "--no-show") | Out-Host
@@ -194,6 +214,7 @@ if ($NoMacro)        { $fmArgs += "--no-macro" }
 if ($NoWatchlist)    { $fmArgs += "--no-watchlist" }
 if ($Since)          { $fmArgs += @("--since", $Since) }
 
+if (-not $NoLLM) { Test-WeeklyBudget "fund_manager" }
 Write-Host "Fund manager step ..." -ForegroundColor Cyan
 Invoke-TaPython $fmArgs | Out-Host
 $code = $LASTEXITCODE

@@ -2,6 +2,8 @@
   "_note": "GUIDANCE ONLY - Cayden's rough target split in % of total account. The fund manager may deviate when the agents' ratings or risk argue for it, and must explain why. Cash is DYNAMIC: the 'cash' weight is only a soft default; each run the fund manager picks a target cash % inside cash_policy.",
   "is_guidance": true,
   "cash_policy": { "min_pct": 5, "max_pct": 35, "soft_default_pct": 12 },
+  "weekly_budget_usd": 25,
+  "budget": { "weekly_usd": 25, "native_run_estimate_usd": 2, "fund_manager_estimate_usd": 1.5 },
   "ai_sleeve": {
     "cap_pct": 50,
     "as_of": "2026-11-05",
