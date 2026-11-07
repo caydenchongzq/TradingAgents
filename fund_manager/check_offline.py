@@ -1,6 +1,7 @@
 """Free checks for the fund-manager add-on. No network and no LLM calls."""
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -168,7 +169,111 @@ def main() -> int:
     good.loc[1, "Close"] = 181.6
     close, last = preflight._bar_close(good, cal.date(2026, 11, 5))
     assert abs(close - 181.6) < 0.01, close
+
+    sleeve = fm.DEFAULT_AI_SLEEVE
+    assert fm.sleeve_fraction("QQQ", "core_index", sleeve) == 0.50
+    assert fm.sleeve_fraction("SMH", "ai_growth", sleeve) == 1.0
+    assert fm.sleeve_fraction("IWM", "core_index", sleeve) == 0.0
+    assert fm.sleeve_fraction("XLE", "sector_etf", sleeve) == 0.0
+    assert fm.sleeve_fraction("XLF", "sector_etf", sleeve) == 0.0
+    assert fm.sleeve_fraction("GLD", "sector_etf", sleeve) == 0.0
+    assert fm.sleeve_fraction("SPY", "core_index", sleeve) == 0.33
+    assert fm.is_etf_instrument("DRAM", {"type": "etf"})
+    assert fm.is_etf_instrument("QQQ", {})
+    assert not fm.is_etf_instrument("NVDA", {"type": "EQUITY"})
+    assert fm.trading_sleeve("SPY", {}) == "core_etf"
+    assert fm.trading_sleeve("AAPL", {"type": "EQUITY"}) == "swing"
+
+    def _sleeve_book(etf_value: float):
+        total = 100000.0
+        stock = 40000.0
+        cash = total - etf_value - stock
+        return {
+            "account": {"cash": cash, "total_value": total},
+            "cash_policy": {"min_pct": 5, "max_pct": 35},
+            "positions": [
+                {"ticker": "SPY", "quantity": etf_value / 100, "price": 100, "type": "ETF",
+                 "theme": "core_index", "ann_vol_pct": 14, "history_bars": 501,
+                 "stress_beta": 1.0, "atr_stop": 90},
+                {"ticker": "AAPL", "quantity": stock / 100, "price": 100, "type": "EQUITY",
+                 "theme": "megacap_quality", "ann_vol_pct": 22, "history_bars": 501,
+                 "stress_beta": 1.1, "atr_stop": 90},
+            ],
+            "watchlist": [
+                {"ticker": "XLV", "type": "etf", "price": 100, "ann_vol_pct": 16,
+                 "history_bars": 501, "stress_beta": 0.7},
+            ],
+            "risk_policy": dict(fm.RISK_POLICY),
+        }
+
+    def _hold(book):
+        return {
+            "cash_decision": {"target_cash_pct": book["account"]["cash"] / book["account"]["total_value"] * 100},
+            "levels": [
+                {"ticker": "SPY", "stop_or_reassess": 90},
+                {"ticker": "AAPL", "stop_or_reassess": 90},
+            ],
+            "trades": [
+                {"ticker": "SPY", "action": "HOLD", "shares": 0, "decision": "keep"},
+                {"ticker": "AAPL", "action": "HOLD", "shares": 0, "decision": "keep"},
+            ],
+        }
+
+    ok_book = _sleeve_book(26400)
+    ok_check = fm.validate_trades(_hold(ok_book), ok_book)
+    assert ok_check["sleeves"]["status"] == "ok", ok_check["sleeves"]
+    assert abs(ok_check["sleeves"]["core_etf"]["weight_pct"] - 26.4) < 0.05, ok_check["sleeves"]
+    assert not any("core ETF" in w for w in ok_check["warnings"]), ok_check["warnings"]
+    assert next(a for a in ok_check["post_trade"] if a["ticker"] == "SPY")["sleeve"] == "core_etf"
+    assert next(a for a in ok_check["post_trade"] if a["ticker"] == "AAPL")["sleeve"] == "swing"
+    assert next(a for a in ok_check["post_trade"] if a["ticker"] == "cash")["sleeve"] == "swing"
+    warn_check = fm.validate_trades(_hold(_sleeve_book(31000)), _sleeve_book(31000))
+    assert warn_check["sleeves"]["status"] == "warn", warn_check["sleeves"]
+    assert warn_check["breaches"] == [], warn_check["breaches"]
+    assert any("above the 30%" in w for w in warn_check["warnings"]), warn_check["warnings"]
+    breach_check = fm.validate_trades(_hold(_sleeve_book(33000)), _sleeve_book(33000))
+    assert breach_check["sleeves"]["status"] == "breach", breach_check["sleeves"]
+    assert breach_check["breaches"], breach_check
+    etf_only = _sleeve_book(20000)
+    no_stop = {
+        "cash_decision": {"target_cash_pct": 20},
+        "levels": [{"ticker": "AAPL", "stop_or_reassess": 90}],
+        "trades": [
+            {"ticker": "XLV", "action": "BUY", "shares": 10, "decision": "new_position"},
+            {"ticker": "AAPL", "action": "HOLD", "shares": 0, "decision": "keep"},
+        ],
+    }
+    # Drop SPY so the buy is the only ETF and still under the sleeve cap.
+    etf_only["positions"] = [p for p in etf_only["positions"] if p["ticker"] != "SPY"]
+    etf_only["account"]["cash"] = 60000
+    loose = fm.validate_trades(no_stop, etf_only)
+    loose_text = " ".join(loose["warnings"])
+    assert "XLV: no stop" not in loose_text, loose_text
+    assert next(t for t in loose["trades"] if t["ticker"] == "XLV")["sleeve"] == "core_etf"
+
+    plan = Path(__file__).resolve().parents[2] / "data" / "fund_manager" / "2026-11-06" / "213439_bc6b2b"
+    report = json.loads((plan / "portfolio_report.json").read_text(encoding="utf-8"))
+    saved = json.loads((plan / "portfolio_stats.json").read_text(encoding="utf-8"))
+    live = fm.validate_trades(report["final"], saved)
+    live_text = " ".join(live["warnings"])
+    assert live["sleeves"]["status"] == "ok", live["sleeves"]
+    assert abs(live["sleeves"]["core_etf"]["weight_pct"] - 26.4) < 0.25, live["sleeves"]
+    assert "core ETF sleeve" not in live_text, live_text
+    assert live["breaches"] == [], live["breaches"]
+    for ticker in ("SPY", "XLV", "XLP"):
+        row = next(a for a in live["post_trade"] if a["ticker"] == ticker)
+        assert row["sleeve"] == "core_etf" and row["shares_after"], row
+    assert next(a for a in live["post_trade"] if a["ticker"] == "V")["sleeve"] == "swing"
+    watch = json.loads((Path(__file__).resolve().parents[2] / "data" / "watchlist.json").read_text(encoding="utf-8"))
+    names = [item["ticker"] for item in watch]
+    assert len(names) == len(set(names))
+    assert 30 <= len(names) <= 50, len(names)
+    for ticker in ("QQQ", "SMH", "IWM", "XLE", "XLF", "GLD"):
+        assert ticker in names, ticker
     print("check_offline: ok")
+    print(f"  plan 213439 core ETF {live['sleeves']['core_etf']['weight_pct']}% "
+          f"swing {live['sleeves']['swing']['weight_pct']}% status {live['sleeves']['status']}")
+    print(f"  watchlist {len(names)} names")
     print(f"  speaking {order_a} vs {order_b}")
     print(f"  post-trade beta {risk['beta_spy']} AI {risk['ai_lookthrough_pct']}%")
     return 0

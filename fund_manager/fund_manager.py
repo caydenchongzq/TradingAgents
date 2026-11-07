@@ -45,7 +45,10 @@ REGIME_SYMBOLS = ["QQQ", "SMH", "IWM", "^VIX", "^VIX3M"]
 # and -0.12 over 60 sessions, below MSFT and GOOG and below 0.5).
 DEFAULT_AI_SLEEVE = {
     "theme_weight": {"ai_growth": 1.0},
-    "ticker_weight": {"AAPL": 0.0, "MSFT": 1.0, "GOOG": 1.0, "GOOGL": 1.0, "SPY": 0.33},
+    "ticker_weight": {
+        "AAPL": 0.0, "MSFT": 1.0, "GOOG": 1.0, "GOOGL": 1.0, "SPY": 0.33,
+        "QQQ": 0.50, "SMH": 1.0, "IWM": 0.0, "XLE": 0.0, "XLF": 0.0, "GLD": 0.0,
+    },
     "cap_pct": 50.0,
 }
 SUBTHEMES = (
@@ -70,7 +73,15 @@ RISK_POLICY = {
     "top3_cap_pct": 50.0,
     "min_trade_usd": 500.0,
     "earnings_warn_days": 7,
+    # Core ETF sleeve is ~30% of the account. Above 30 warns; above 32 breaches.
+    # The rest is the swing sleeve: single stocks plus cash reserved for swings.
+    "core_etf_warn_pct": 30.0,
+    "core_etf_breach_pct": 32.0,
 }
+# Used when a holding has no quote type. Any instrument whose type is etf counts too.
+KNOWN_ETFS = frozenset({
+    "SPY", "QQQ", "SMH", "IWM", "XLE", "XLF", "GLD", "XLV", "XLP", "XLU", "TLT", "DRAM", "DISK",
+})
 
 
 def log(msg: str) -> None:
@@ -502,6 +513,44 @@ def resolve_ai_sleeve(targets: dict | None) -> dict:
     return out
 
 
+def is_etf_instrument(ticker: str, info: dict | None = None) -> bool:
+    """True for any ETF. Type comes from the watchlist or from Yahoo's quote type."""
+    kind = str((info or {}).get("type") or "").strip().lower()
+    if kind == "etf":
+        return True
+    return str(ticker or "").strip().upper() in KNOWN_ETFS
+
+
+def trading_sleeve(ticker: str, info: dict | None = None) -> str:
+    """core_etf for ETFs held weeks to months. swing for single stocks and cash."""
+    if str(ticker or "").strip().upper() in {"", "CASH"}:
+        return "swing"
+    return "core_etf" if is_etf_instrument(ticker, info) else "swing"
+
+
+def _sleeve_book(rows: list[dict], cash: float, total: float) -> dict:
+    """Unrealized P&L and weight by sleeve. Cash sits in the swing sleeve and has no P&L."""
+    out = {
+        "core_etf": {"weight_pct": 0.0, "market_value": 0.0, "cost_basis": 0.0, "unrealized_pnl": 0.0},
+        "swing": {"weight_pct": 0.0, "market_value": 0.0, "cost_basis": 0.0, "unrealized_pnl": 0.0},
+    }
+    for r in rows:
+        bucket = out[r.get("sleeve") if r.get("sleeve") in out else "swing"]
+        bucket["weight_pct"] += r.get("weight_pct") or 0
+        bucket["market_value"] += r.get("market_value") or 0
+        bucket["cost_basis"] += r.get("cost_basis") or 0
+        bucket["unrealized_pnl"] += r.get("unrealized_pnl") or 0
+    out["swing"]["market_value"] += cash
+    out["swing"]["cost_basis"] += cash
+    if total:
+        out["swing"]["weight_pct"] += cash / total * 100
+    for bucket in out.values():
+        bucket["weight_pct"] = round(bucket["weight_pct"], 1)
+        for key in ("market_value", "cost_basis", "unrealized_pnl"):
+            bucket[key] = round(bucket[key], 2)
+    return out
+
+
 def sleeve_fraction(ticker: str, theme: str | None, sleeve: dict | None) -> float:
     """Share of this position's weight that counts in the AI look-through."""
     table = sleeve or DEFAULT_AI_SLEEVE
@@ -645,6 +694,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     total = invested + cash
     for r in rows:
         r["weight_pct"] = (r["market_value"] or 0) / total * 100 if total else None
+        r["sleeve"] = trading_sleeve(r["ticker"], r)
 
     rets_all = close.pct_change(fill_method=None).iloc[1:]
     win1 = rets_all.tail(TRADING_DAYS)          # 1y
@@ -804,7 +854,8 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     top_risk = contrib.sort_values(ascending=False).index[0] if len(contrib) else None
     for c in watchlist:
         tk = c["ticker"]
-        ent = {**c, "price": quotes.get(tk, {}).get("price"), "has_agent_report": tk in reports,
+        ent = {**c, "sleeve": trading_sleeve(tk, c), "price": quotes.get(tk, {}).get("price"),
+               "has_agent_report": tk in reports,
                "sub_theme": c.get("sub_theme") or subtheme_of(tk, themes),
                "agent_rating": reports.get(tk, {}).get("pm_rating") if tk in reports else None,
                **({k: v for k, v in (meta.get(tk) or {}).items() if k == "name"})}
@@ -847,6 +898,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
         "account": {"total_value": round(total, 2), "invested": round(invested, 2), "cash": cash,
                     "cash_pct": round(cash / total * 100, 1) if total else None,
                     "unrealized_pnl": round(sum(r["unrealized_pnl"] or 0 for r in rows), 2)},
+        "sleeves": _sleeve_book(rows, cash, total),
         "cash_policy": cash_policy,
         "positions": rows,
         "risk": {"portfolio_ann_vol_pct": round(port_vol * 100, 1),
@@ -908,6 +960,13 @@ Rules:
    weight by sub-theme and is not itself the look-through cap.
    Flag earnings inside earnings_warn_days rather than adding into them. Regime values carry their dates;
    a stale flag means the print is older than one session (or one release for monthly series).
+9. Core ETF sleeve vs swing sleeve. An ETF (quote type etf, including SPY, QQQ, SMH, IWM, XLE, XLF,
+   GLD, XLV, XLP, and any other ETF) is sleeve `core_etf`. Single stocks and cash are sleeve `swing`.
+   The core ETF sleeve is about 30% of the account: above 30% (`core_etf_warn_pct`) is a warning, above
+   32% (`core_etf_breach_pct`) is a breach. The remaining ~70% is the swing sleeve (single stocks plus
+   cash reserved for swings). ETFs are held for weeks to months. Do not apply swing-trading rules or
+   tight stops to them. A reassessment level over that horizon is enough; omitting a tight stop on an
+   ETF is not a breach. Each position and candidate already carries `sleeve`.
 This is decision support, not financial advice."""
 
 ANALYST_ROLES = {
@@ -926,6 +985,9 @@ adjustments that best improve risk-adjusted outcome.""",
 ANALYST_TASK = """Critique the Fund Manager's DRAFT plan using the whole-portfolio stats (correlation clusters,
 1y/2y beta, VaR, risk contribution, stress tests, concentration, target drift, regime, macro) and the
 watchlist candidates. Debate the CASH level explicitly (give your own target cash %, inside the band).
+The core ETF sleeve (any ETF) should stay near 30% of the account: above 30% warns and above 32%
+breaches. The other ~70% is the swing sleeve (single stocks plus cash reserved for swings). ETFs are
+held for weeks to months, so do not ask for swing rules or tight stops on them.
 Respond directly to the other analysts' earlier points where present. Propose specific whole-share changes
 (ticker, action, shares) or say 'no change'. Be concise and numeric (<= ~500 words of content)."""
 
@@ -1172,7 +1234,8 @@ def validate_trades(decision: dict, stats: dict) -> dict:
         if (t.get("order_type") or "").lower() == "staged" and act in ("BUY", "SELL") and sh:
             warnings.append(f"{tk}: staged order is counted as filled in the post-trade cash and risk figures")
         seen.add(tk)
-        rows.append({**t, "shares": sh, "value_usd": round(sh * px, 2), "calc_price": round(px, 2)})
+        rows.append({**t, "shares": sh, "value_usd": round(sh * px, 2), "calc_price": round(px, 2),
+                     "sleeve": trading_sleeve(tk, info)})
     missing = [tk for tk in pos if tk not in seen]
     if missing:
         warnings.append(f"no instruction for: {', '.join(missing)} (treated as HOLD)")
@@ -1193,6 +1256,7 @@ def validate_trades(decision: dict, stats: dict) -> dict:
     after = []
     beta_w = 0.0
     ai = 0.0
+    etf_raw = 0.0
     assumed = []
     for tk, q in new_qty.items():
         info = _info_for(tk, pos, wl)
@@ -1211,8 +1275,11 @@ def validate_trades(decision: dict, stats: dict) -> dict:
         frac = sleeve_fraction(tk, info.get("theme"), policy.get("ai_sleeve"))
         if frac and q:
             ai += weight * frac
+        sleeve = trading_sleeve(tk, info)
+        if sleeve == "core_etf" and q:
+            etf_raw += weight
         downside, downside_src = None, None
-        if q:
+        if q and sleeve != "core_etf":
             stop = _stop_number((levels.get(tk) or {}).get("stop_or_reassess"))
             if stop is None:
                 fallback = _stop_number(info.get("atr_stop"))
@@ -1231,9 +1298,13 @@ def validate_trades(decision: dict, stats: dict) -> dict:
                 warnings.append(
                     f"{tk}: earnings {earn.get('date')} in {days} calendar days "
                     f"(warning window is {policy['earnings_warn_days']} days)")
+        elif q:
+            stop = _stop_number((levels.get(tk) or {}).get("stop_or_reassess"))
+            if stop is not None:
+                downside, downside_src = stop, "plan"
         after.append({"ticker": tk, "shares_after": q, "value_after": round(value, 2),
                       "weight_after_pct": round(weight, 1), "is_new": tk not in pos,
-                      "beta": round(beta, 2), "beta_source": beta_src,
+                      "sleeve": sleeve, "beta": round(beta, 2), "beta_source": beta_src,
                       "downside": downside, "downside_source": downside_src})
     if assumed:
         warnings.append("post-trade beta uses 1.0 for: " + ", ".join(assumed))
@@ -1256,14 +1327,39 @@ def validate_trades(decision: dict, stats: dict) -> dict:
         shocks[f"SPY_{int(shock * 100)}pct_beta_scaled"] = {
             "pnl_usd": round(pnl, 0), "pnl_pct_of_account": round(pnl / total * 100, 1) if total else None}
     after.append({"ticker": "cash", "shares_after": None, "value_after": round(cash, 2),
-                  "weight_after_pct": round(cash_pct, 1), "is_new": False,
+                  "weight_after_pct": round(cash_pct, 1), "is_new": False, "sleeve": "swing",
                   "beta": 0.0, "beta_source": "cash", "downside": None, "downside_source": None})
+    warn_at = float(policy["core_etf_warn_pct"])
+    breach_at = float(policy["core_etf_breach_pct"])
+    breaches = []
+    if etf_raw > breach_at + 0.05:
+        msg = (f"core ETF sleeve {etf_raw:.1f}% breaches the {breach_at:.0f}% cap "
+               f"(guide {warn_at:.0f}%; the rest is the swing sleeve)")
+        warnings.append(msg)
+        breaches.append(msg)
+        etf_status = "breach"
+    elif etf_raw > warn_at + 0.05:
+        warnings.append(
+            f"core ETF sleeve {etf_raw:.1f}% is above the {warn_at:.0f}% guide "
+            f"(breach above {breach_at:.0f}%; the rest is the swing sleeve)")
+        etf_status = "warn"
+    else:
+        etf_status = "ok"
+    sleeves = {
+        "core_etf": {"weight_pct": round(etf_raw, 1)},
+        "swing": {"weight_pct": round(100 - etf_raw, 1) if total else 0.0},
+        "status": etf_status,
+        "warn_pct": warn_at,
+        "breach_pct": breach_at,
+    }
     post_trade_risk = {"beta_spy": round(beta_w, 2), "ai_lookthrough_pct": round(ai, 1),
-                       "top3_pct": round(top3, 1), "stress": shocks,
-                       "note": "Beta and stress are share-weighted from each name's stress beta (else 1y beta, else 1.0). Cash beta is 0. Not a covariance recomputation."}
+                       "top3_pct": round(top3, 1), "core_etf_pct": round(etf_raw, 1),
+                       "swing_pct": round(100 - etf_raw, 1) if total else 0.0,
+                       "core_etf_status": etf_status, "stress": shocks,
+                       "note": "Beta and stress are share-weighted from each name's stress beta (else 1y beta, else 1.0). Cash beta is 0. Not a covariance recomputation. core_etf is every ETF; swing is single stocks plus cash."}
     return {"trades": rows, "post_trade": after, "ending_cash": round(cash, 2),
-            "ending_cash_pct": round(cash_pct, 1), "warnings": warnings,
-            "post_trade_risk": post_trade_risk}
+            "ending_cash_pct": round(cash_pct, 1), "warnings": warnings, "breaches": breaches,
+            "sleeves": sleeves, "post_trade_risk": post_trade_risk}
 
 
 def diff_plans(draft: dict | None, final: dict | None) -> list[dict]:
@@ -1311,7 +1407,9 @@ def render_plan_trades(L, plan, check, targets, sleeve=None):
     risk = check.get("post_trade_risk") or {}
     if risk:
         L.append(f"Post-trade beta (code): **{risk.get('beta_spy')}** | AI look-through **{risk.get('ai_lookthrough_pct')}%** "
-                 f"({sleeve_label(sleeve)}) | top 3 **{risk.get('top3_pct')}%**")
+                 f"({sleeve_label(sleeve)}) | top 3 **{risk.get('top3_pct')}%** | "
+                 f"core ETF sleeve **{risk.get('core_etf_pct')}%** ({risk.get('core_etf_status')}) | "
+                 f"swing sleeve **{risk.get('swing_pct')}%**")
         L.append("Post-trade stress (code, beta-scaled): " + "; ".join(
             f"{k}: {fmt_money(v['pnl_usd'])} ({v['pnl_pct_of_account']}%)" for k, v in (risk.get("stress") or {}).items()))
         if risk.get("note"):
@@ -1709,7 +1807,7 @@ def main() -> int:
             print(f"  changed vs draft: {d['ticker']}: {d['draft']} -> {d['final']}")
         risk = chk.get("post_trade_risk") or {}
         if risk:
-            print(f"  post-trade beta {risk.get('beta_spy')} | AI look-through {risk.get('ai_lookthrough_pct')}% | top 3 {risk.get('top3_pct')}%")
+            print(f"  post-trade beta {risk.get('beta_spy')} | AI look-through {risk.get('ai_lookthrough_pct')}% | top 3 {risk.get('top3_pct')}% | core ETF {risk.get('core_etf_pct')}% ({risk.get('core_etf_status')})")
         for w in chk["warnings"]:
             print(f"  ! {w}")
     if calls:
