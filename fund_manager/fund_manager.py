@@ -1564,6 +1564,7 @@ def main() -> int:
     ap.add_argument("--include-risk", action="store_true", help="also feed the per-stock risk-debate notes")
     ap.add_argument("--corr-threshold", type=float, default=0.5)
     ap.add_argument("--no-macro", action="store_true")
+    ap.add_argument("--context-file", default="", help="markdown appended to the fund-manager prompt")
     ap.add_argument("--no-llm", action="store_true", help="quant snapshot only, no model call")
     args = ap.parse_args()
 
@@ -1612,6 +1613,16 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     pre = "snapshot_" if args.no_llm else ""
     context = build_context(book, targets, stats, reports, macro, args.date)
+    if args.context_file:
+        extra_path = Path(args.context_file)
+        if not extra_path.is_file():
+            log(f"context file missing: {extra_path}")
+            return 2
+        extra = extra_path.read_text(encoding="utf-8")
+        context += ("\n\n## Theme scout ranking\n"
+                    "This ranking covers the whole book and the names in scope. "
+                    "Rank 1 is the strongest. A holding marked trim is a weak position. "
+                    "Only the listed candidates are in scope for new buys.\n\n" + extra)
     plan = _apply_cli_overrides(agent_plan_from_config(), args)
     fm_spec = plan["fm_manager"]
     (out_dir / f"{pre}prompt.md").write_text(fm_spec["system"] + "\n\n" + context, encoding="utf-8")

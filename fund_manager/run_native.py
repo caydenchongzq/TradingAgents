@@ -142,5 +142,34 @@ def _boot_agent_config() -> None:
 _boot_agent_config()
 
 
+def _install_macro_context() -> None:
+    """Append the saved theme-scout note to every agent's instrument context."""
+    raw = os.environ.get("ARGUS_MACRO_CONTEXT_FILE", "").strip()
+    if not raw:
+        return
+    path = Path(raw)
+    if not path.is_file():
+        print(f"[run_native] macro context file missing: {path}", flush=True)
+        raise SystemExit(2)
+    text = path.read_text(encoding="utf-8").strip()
+    if len(text) > 12000:
+        text = text[:12000] + "\n…[theme scout context truncated]"
+    block = "\n\n## Theme scout (macro ranking for this book)\n" + text
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    orig = TradingAgentsGraph.create_run_state
+
+    def wrapped(self, company_name, trade_date, asset_type="stock", portfolio=None):
+        state = orig(self, company_name, trade_date, asset_type, portfolio)
+        state["instrument_context"] = (state.get("instrument_context") or "") + block
+        return state
+
+    TradingAgentsGraph.create_run_state = wrapped  # type: ignore[method-assign]
+    print(f"[run_native] macro context attached ({len(text)} chars)", flush=True)
+
+
+_install_macro_context()
+
+
 if __name__ == "__main__":
     app()

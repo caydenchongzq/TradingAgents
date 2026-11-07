@@ -62,6 +62,19 @@ def main() -> int:
     assert len(trimmed) == 50, len(trimmed)
     assert sum(1 for c in tchanges if c["action"] == "trim") == 2
 
+    ordered, errors = ts.normalize_ranking(
+        [{"ticker": "bbb", "rank": 2, "bucket": "candidate", "action": "pass", "reason": "weak"},
+         {"ticker": "AAA", "rank": 1, "bucket": "holding", "action": "keep", "reason": "strong"},
+         {"ticker": "CCC", "rank": 3, "bucket": "candidate", "action": "trim", "reason": "wrong action still stored"}],
+        ["AAA"], ["BBB", "CCC"])
+    assert errors == [], errors
+    assert [row["ticker"] for row in ordered] == ["AAA", "BBB", "CCC"]
+    assert ordered[2]["action"] == "trim" and ordered[2]["bucket"] == "candidate"
+    bad, bad_errors = ts.normalize_ranking(
+        [{"ticker": "AAA", "rank": 1, "action": "keep", "reason": "only one"}],
+        ["AAA"], ["BBB"])
+    assert bad_errors and any("missing" in err for err in bad_errors)
+
     held = ["NVDA"]
     tier = ts.tier_candidates(held, ranked + [{"ticker": "NVDA", "rank": 0, "score": 9},
                                               {"ticker": "CCC", "rank": 3, "score": 1, "error": "no prices"}], 1)

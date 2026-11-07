@@ -20,7 +20,8 @@ param(
   [switch]$DryRun,
   [string]$Date = "",
   [int]$TierN = 8,
-  [string]$Model = "openai/gpt-6.1-sol"
+  [string]$Model = "openai/gpt-6.1-sol",
+  [switch]$KeepWatchlist                 # save the report; do not rewrite watchlist.json
 )
 
 $ErrorActionPreference = "Continue"
@@ -37,6 +38,7 @@ if ($Date) { $pyArgs += @("--date", $Date) }
 if ($Screen) { $pyArgs += "--screen" }
 if ($NoLLM) { $pyArgs += "--no-llm" }
 if ($DryRun) { $pyArgs += "--dry-run" }
+if ($KeepWatchlist) { $pyArgs += "--keep-watchlist" }
 
 & docker compose run --rm -T -e "TZ=$NyTz" --entrypoint python `
   -v "${ScoutDir}:/home/appuser/theme_scout:ro" `

@@ -470,6 +470,17 @@ def render_report_md(payload: dict) -> str:
         lines.append(", ".join(f"{r['ticker']} in {r['earnings_days']}d" for r in soon))
     else:
         lines.append("None in the screened names.")
+    lines.append("\n## Book and watchlist ranking")
+    ranking = payload.get("ranking") or []
+    if ranking:
+        lines.append("Rank 1 is the strongest name. A holding marked trim is a weak position.")
+        lines.append("| Rank | Ticker | Bucket | Action | Reason |\n|---|---|---|---|---|")
+        ordered = sorted(ranking, key=lambda row: (row.get("rank") if isinstance(row.get("rank"), int) else 10**6, row.get("ticker") or ""))
+        for row in ordered:
+            reason = str(row.get("reason") or "").replace("|", "/")
+            lines.append(f"| {row.get('rank')} | {row.get('ticker')} | {row.get('bucket')} | {row.get('action')} | {reason} |")
+    else:
+        lines.append("No model ranking.")
     lines.append("\n## Theme stances")
     if payload.get("themes"):
         for theme in payload["themes"]:
@@ -492,11 +503,16 @@ def render_report_md(payload: dict) -> str:
 
 
 SCOUT_SYSTEM = """You are the theme scout for a concentrated US equity book. You see macro prints, a week of headlines,
-relative strength of sectors and AI sub-themes versus SPY, upcoming earnings, and a quant screen.
-Rank each listed theme overweight, neutral, or avoid. Propose watchlist adds and drops so the list stays
-between 30 and 50 names. Do not invent tickers you were not shown unless they are liquid US listings you
-name explicitly. Prefer dropping weak relative-strength names over adding lookalikes. This is research support,
-not an order."""
+relative strength of sectors and AI sub-themes versus SPY, upcoming earnings, and a quant screen of every
+holding and every watchlist name.
+Rank the WHOLE list in `names`. Rank 1 is the strongest name for this book right now. A strong holding ranks
+ahead of a weak one. Put every shown ticker in `ranking` exactly once, with ranks 1 through N and no gaps.
+Mark a holding you would keep `keep` and a weak holding you would sell down `trim`. Mark a candidate you
+would buy `add` and one you would not `pass`. Do not answer with new-name ideas only.
+Also mark each listed theme overweight, neutral, or avoid. You may propose watchlist adds and drops so the
+list stays between 30 and 50 names. Do not invent tickers you were not shown unless they are liquid US
+listings you name explicitly. Prefer dropping weak relative-strength names over adding lookalikes. This is
+research support, not an order."""
 
 
 def agent_plan_from_config() -> dict:
@@ -542,8 +558,15 @@ def call_scout(model: str, context: str, system: str | None = None, max_tokens: 
                 "ticker": {"type": "string"}, "reason": {"type": "string"},
             }, "required": ["ticker", "reason"]}},
             "note": {"type": "string"},
+            "ranking": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {
+                "ticker": {"type": "string"},
+                "rank": {"type": "integer"},
+                "bucket": {"type": "string", "enum": ["holding", "candidate"]},
+                "action": {"type": "string", "enum": ["keep", "trim", "add", "pass"]},
+                "reason": {"type": "string"},
+            }, "required": ["ticker", "rank", "bucket", "action", "reason"]}},
         },
-        "required": ["headline", "themes", "add", "drop", "note"],
+        "required": ["headline", "themes", "add", "drop", "note", "ranking"],
     }
     client = OpenAI(base_url=OPENROUTER_BASE, api_key=key, timeout=900, max_retries=2)
     t0 = time.time()
@@ -571,6 +594,65 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def normalize_ranking(rows, holdings: list[str], candidates: list[str]) -> tuple[list[dict], list[str]]:
+    """Every holding and candidate once, ranks 1..N. Rank 1 is the strongest name."""
+    errors: list[str] = []
+    held: list[str] = []
+    for ticker in holdings:
+        tk = str(ticker).strip().upper()
+        if tk and tk not in held:
+            held.append(tk)
+    held_set = set(held)
+    cands: list[str] = []
+    for ticker in candidates:
+        tk = str(ticker).strip().upper()
+        if tk and tk not in held_set and tk not in cands:
+            cands.append(tk)
+    expected = held + cands
+    by: dict[str, dict] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            errors.append("ranking row is not an object")
+            continue
+        tk = str(row.get("ticker") or "").strip().upper()
+        if not tk:
+            errors.append("ranking row missing ticker")
+            continue
+        if tk in by:
+            errors.append(f"duplicate rank row {tk}")
+            continue
+        try:
+            rank = int(row.get("rank"))
+        except (TypeError, ValueError):
+            errors.append(f"{tk} rank is not an integer")
+            continue
+        action = str(row.get("action") or "").strip().lower()
+        if action not in {"keep", "trim", "add", "pass"}:
+            errors.append(f"{tk} action {action!r} is not keep, trim, add, or pass")
+            continue
+        if tk in held_set:
+            bucket = "holding"
+        elif tk in cands:
+            bucket = "candidate"
+        else:
+            errors.append(f"{tk} was not in the book or the watchlist")
+            continue
+        by[tk] = {
+            "ticker": tk, "rank": rank, "bucket": bucket, "action": action,
+            "reason": str(row.get("reason") or "").strip(),
+        }
+    missing = [tk for tk in expected if tk not in by]
+    if missing:
+        errors.append("missing from ranking: " + ", ".join(missing))
+    ranks = [by[tk]["rank"] for tk in by]
+    if len(ranks) != len(set(ranks)):
+        errors.append("ranks are not unique")
+    if expected and (len(by) != len(expected) or not ranks or min(ranks) != 1 or max(ranks) != len(expected)):
+        errors.append(f"ranks must be 1 through {len(expected)}")
+    ordered = sorted(by.values(), key=lambda row: row["rank"])
+    return ordered, errors
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Theme scout and daily quant screen")
     ap.add_argument("--date", default=date.today().isoformat())
@@ -581,6 +663,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="same as --no-llm")
     ap.add_argument("--tier-n", type=int, default=8)
     ap.add_argument("--model", default=None, help="omit to use addons/agent_config.json")
+    ap.add_argument("--keep-watchlist", action="store_true",
+                    help="save the scout report and do not rewrite watchlist.json")
     args = ap.parse_args()
     scout = agent_plan_from_config()["theme_scout"]
     scout_model = args.model or scout["model"]
@@ -641,39 +725,86 @@ def main() -> int:
         "llm": None,
     }
     if not no_llm:
+        held_set = set(holdings)
+        names = [{"ticker": tk, "bucket": "holding"} for tk in holdings]
+        names += [{"ticker": w["ticker"], "bucket": "candidate", "sector": w.get("sector"),
+                   "type": w.get("type"), "sub_theme": w.get("sub_theme")}
+                  for w in watch if w["ticker"] not in held_set]
         context = json.dumps({
             "date": args.date,
             "macro": macro,
             "headlines": headlines[:24],
             "relative_strength": strength,
             "earnings_within_14d": [r for r in ranked if isinstance(r.get("earnings_days"), int) and r["earnings_days"] <= 14],
-            "screen_top": ranked[:15],
-            "screen_bottom": ranked[-10:],
-            "watchlist": [w["ticker"] for w in watch],
+            "names": names,
+            "screen": ranked,
             "subthemes": list(subthemes),
+            "rank_count": len(names),
         }, indent=1, default=str)
+        rank_tokens = max(int(scout["max_tokens"] or 6000), 16000)
         log(f"one scout call ({scout_model})")
-        log(f"agent config: theme_scout={scout_model} effort={scout['effort']} max_tokens={scout['max_tokens']}")
-        result = call_scout(scout_model, context, scout["system"], scout["max_tokens"], scout["effort"], scout["temperature"])
+        log(f"agent config: theme_scout={scout_model} effort={scout['effort']} max_tokens={rank_tokens}")
+        log(f"ranking {len(names)} names ({len(holdings)} holdings + {len(names) - len(holdings)} candidates)")
+        try:
+            result = call_scout(scout_model, context, scout["system"], rank_tokens, scout["effort"], scout["temperature"])
+        except Exception as exc:  # noqa: BLE001
+            log("scout call failed: " + _safe(exc))
+            return 1
         parsed = result["parsed"]
         payload["llm"] = {"model": scout_model, "seconds": result["seconds"], "usage": result["usage"]}
         payload["headline"] = parsed.get("headline") or ""
         payload["themes"] = parsed.get("themes") or []
+        ordered, rank_errors = normalize_ranking(parsed.get("ranking") or [], holdings, [w["ticker"] for w in watch])
+        payload["ranking"] = ordered or (parsed.get("ranking") or [])
+        payload["ranking_errors"] = rank_errors
+        usage = result.get("usage") or {}
+        log(f"scout done in {result['seconds']}s tokens_in={usage.get('prompt_tokens')} tokens_out={usage.get('completion_tokens')} cost={usage.get('cost')}")
+        if rank_errors:
+            for err in rank_errors:
+                log("ranking rejected: " + err)
+            _write(out_dir / "report.json", json.dumps(payload, indent=2, default=str))
+            _write(out_dir / "report.md", render_report_md(payload))
+            print("REPORT_PATH=" + str(out_dir / "report.md"))
+            return 1
         scores = {r["ticker"]: r.get("score") if r.get("score") is not None else -1e9 for r in ranked}
-        updated, changes = apply_watchlist(watch, parsed.get("add") or [], parsed.get("drop") or [], scores)
-        payload["changes"] = changes
-        payload["watchlist_size"] = len(updated)
-        if changes and watch_path.exists():
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup = watch_path.with_name(watch_path.name + f".bak_{stamp}")
-            shutil.copy2(watch_path, backup)
-            payload["watchlist_backup"] = str(backup)
-            watch_path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
-            log(f"watchlist updated ({len(watch)} -> {len(updated)}); backup {backup.name}")
-        elif changes:
-            log("changes were computed but the watchlist file is missing, so nothing was written")
+        if args.keep_watchlist:
+            payload["changes"] = []
+            payload["watchlist_size"] = len(watch)
+            log("watchlist left unchanged")
+        else:
+            updated, changes = apply_watchlist(watch, parsed.get("add") or [], parsed.get("drop") or [], scores)
+            payload["changes"] = changes
+            payload["watchlist_size"] = len(updated)
+            if changes and watch_path.exists():
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup = watch_path.with_name(watch_path.name + f".bak_{stamp}")
+                shutil.copy2(watch_path, backup)
+                payload["watchlist_backup"] = str(backup)
+                watch_path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+                log(f"watchlist updated ({len(watch)} -> {len(updated)}); backup {backup.name}")
+            elif changes:
+                log("changes were computed but the watchlist file is missing, so nothing was written")
+        top = [row["ticker"] for row in ordered if row["bucket"] == "candidate"][: args.tier_n]
+        payload["top_non_holdings"] = top
+        print("TOP_NON_HOLDINGS=" + ",".join(top))
+        print("HOLDING_RANKS=" + ",".join(
+            f"{row['ticker']}:{row['rank']}:{row['action']}" for row in ordered if row["bucket"] == "holding"))
     _write(out_dir / "report.json", json.dumps(payload, indent=2, default=str))
     _write(out_dir / "report.md", render_report_md(payload))
+    if payload.get("ranking") and not payload.get("ranking_errors"):
+        lines = [f"# Theme scout context {payload['date']}", "", str(payload.get("headline") or ""), ""]
+        for theme in payload.get("themes") or []:
+            lines.append(f"- {theme.get('id')}: {theme.get('stance')} — {theme.get('reason')}")
+        lines.append("")
+        lines.append("| Rank | Ticker | Bucket | Action | Reason |")
+        lines.append("|---|---|---|---|---|")
+        for row in payload["ranking"]:
+            reason = str(row.get("reason") or "").replace("|", "/")
+            if len(reason) > 160:
+                reason = reason[:157] + "..."
+            lines.append(f"| {row['rank']} | {row['ticker']} | {row['bucket']} | {row['action']} | {reason} |")
+        _write(out_dir / "context.md", "\n".join(lines) + "\n")
+        print("CONTEXT_PATH=" + str(out_dir / "context.md"))
     log(f"report: {out_dir / 'report.md'}")
     print("REPORT_PATH=" + str(out_dir / "report.md"))
     return 0
