@@ -225,3 +225,5 @@ reports/
 # Local backups of secret env files and of edited files
 .env.bak*
 *.bak_2026*
+data/
+results/
