@@ -1,0 +1,5 @@
+.env*
+*.bak_*
+*.bak.*
+__pycache__/
+*.pyc
