@@ -710,6 +710,13 @@ def _build_client(seat: dict, config: dict):
     base = (config or {}).get("backend_url") or "https://openrouter.ai/api/v1"
     client = create_llm_client("openrouter", seat["model"], base_url=base, **kwargs)
     llm = client.get_llm()
+    # Custom native seats get their own model instance instead of one of the
+    # quick/deep tier clients warmed by TradingAgentsGraph. Prime LangChain's
+    # cached serialization now, while factories are being built sequentially,
+    # before the graph can invoke analyst seats concurrently.
+    from langchain_core.language_models import BaseChatModel
+    if isinstance(llm, BaseChatModel):
+        _ = llm._serialized
     if seat.get("effort"):
         try:
             llm = llm.bind(extra_body={"reasoning": {"effort": seat["effort"]}})

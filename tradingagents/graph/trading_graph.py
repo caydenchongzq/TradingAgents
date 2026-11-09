@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import tradingagents
+from langchain_core.language_models import BaseChatModel
 from tradingagents.agents.context import build_instrument_context, resolve_instrument_identity
 from tradingagents.agents.rating import run_rating
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
@@ -78,6 +79,17 @@ class TradingAgentsGraph:
         extra = {"callbacks": self.callbacks} if self.callbacks else {}
         self.deep_thinking_llm = create_tier_client(self.config, "deep", **extra).get_llm()
         self.quick_thinking_llm = create_tier_client(self.config, "quick", **extra).get_llm()
+
+        # LangChain's BaseChatModel._serialized is a cached_property. Analyst
+        # nodes invoke the shared quick model concurrently, and the first
+        # invocation serializes the Pydantic model while caching this property
+        # into its __dict__. On Python 3.12+, cached_property has no lock, so a
+        # concurrent first read can mutate __dict__ during Pydantic iteration
+        # ("dictionary changed size during iteration"). Populate both shared
+        # models here, before any graph workers can invoke them.
+        for llm in (self.deep_thinking_llm, self.quick_thinking_llm):
+            if isinstance(llm, BaseChatModel):
+                _ = llm._serialized
 
         self.memory_log = TradingMemoryLog(self.config)
 

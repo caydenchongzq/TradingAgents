@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,72 @@ def _stats():
 
 
 def main() -> int:
+    normalized_system = " ".join(fm.FM_SYSTEM.split())
+    assert "not inherited percentage targets or owner-imposed limits" in normalized_system
+    assert "without trying to satisfy an arbitrary percentage" in normalized_system
+    assert "single_stock_cap_pct" not in fm.RISK_POLICY and "top3_cap_pct" not in fm.RISK_POLICY
+    assert "min_trade_usd" not in fm.RISK_POLICY
+    assert "do not short, use options or margin, spend more cash than is" in fm.FM_SYSTEM
+    assert "Stay inside them" not in fm.FM_SYSTEM
+    assert "an upcoming earnings date is a risk factor, not an automatic ban" in normalized_system
+    assert "assess gap/event risk" in normalized_system
+    assert fm.source_freshness({"analysis_date": "2026-11-06"}, "2026-11-06")["status"] == "current"
+    assert fm.source_freshness({"analysis_date": "2026-11-02"}, "2026-11-06")["status"] == "reused"
+    assert fm.source_freshness({"analysis_date": "2026-10-28"}, "2026-11-06")["status"] == "stale"
+    assert fm.source_freshness(None, "2026-11-06")["status"] == "missing"
+    with tempfile.TemporaryDirectory(prefix="fm_scout_freshness_") as temp:
+        scout_dir = Path(temp)
+        for day, headline in (("2026-11-02", "older"), ("2026-11-08", "latest"),
+                              ("2026-11-12", "future")):
+            folder = scout_dir / day
+            folder.mkdir()
+            ranking = [{"ticker": f"S{i:03d}", "rank": i + 1, "bucket": "holding" if i < 12 else "candidate"}
+                       for i in range(166)] if day == "2026-11-08" else [{"ticker": "AAA", "rank": 1}]
+            (folder / "report.json").write_text(json.dumps({
+                "date": day, "generated_utc": day + "T12:00:00Z", "headline": headline,
+                "ranking": ranking, "ranking_status": "partial" if day == "2026-11-08" else "complete",
+                "ranking_count": len(ranking), "ranking_expected_count": 166, "changes": [],
+            }), encoding="utf-8")
+        scout = fm.load_scout_report(scout_dir, "2026-11-10")
+        assert scout["status"] == "reused" and scout["date"] == "2026-11-08" and scout["age_days"] == 2, scout
+        assert scout["report"]["headline"] == "latest" and scout["report"]["ranking"][0]["ticker"] == "S000"
+        assert len(scout["report"]["ranking"]) == 166
+        assert scout["report"]["ranking_status"] == "partial"
+        assert fm.load_scout_report(scout_dir, "2026-11-20")["status"] == "stale"
+        assert fm.load_scout_report(scout_dir / "absent", "2026-11-10")["status"] == "missing"
+        watch_path = scout_dir / "watchlist.json"
+        for key in ("items", "candidates", "watchlist", "tickers"):
+            watch_path.write_text(json.dumps({key: [{"ticker": "ZZZ"}]}), encoding="utf-8")
+            assert fm.load_watchlist(watch_path, [])[0]["ticker"] == "ZZZ"
+        watch_path.write_text(json.dumps({"items": [], "candidates": [{"ticker": "SHOULD_NOT_FALLBACK"}]}), encoding="utf-8")
+        assert fm.load_watchlist(watch_path, []) == []
+
+    assert fm.approved_target_weights({"weights_pct": {"AAA": 40}}) == {}
+    assert fm.approved_target_weights({"approved_targets_pct": {"AAA": 40, "bad": 120, "bool": True}}) == {"AAA": 40.0}
+    guide = {"portfolio_guidance": {"cash_reference_pct": 10, "long_term_pct": 30, "swing_pct": 60}}
+    assert fm.approved_portfolio_guidance(guide) == {
+        "cash_reference_pct": 10.0, "long_term_pct": 30.0, "swing_pct": 60.0,
+        "cash_is_soft": True, "force_rebalance": False,
+        "sector_weights_are_guidelines": True, "swing_horizon": "flexible",
+    }
+    assert fm.approved_portfolio_guidance({"portfolio_guidance": {
+        "cash_reference_pct": 15, "long_term_pct": 30, "swing_pct": 60}}) is None
+    alt_guide = {"portfolio_guidance": {"cash_reference_pct": 5, "long_term_pct": 45, "swing_pct": 50}}
+    alt_context = fm.build_context(
+        {"cash": 5000, "positions": []}, alt_guide,
+        {"positions": [], "watchlist": [], "cash_policy": {"min_pct": 0, "max_pct": 100}},
+        {}, None, "2026-11-06")
+    assert "5% cash, 45% long-term and 50% swing" in alt_context
+    assert "Cash can be below 5%, including zero" in alt_context
+    policy_context = fm.build_context(
+        {"cash": 10000, "positions": []}, guide,
+        {"positions": [], "watchlist": [], "cash_policy": {"min_pct": 0, "max_pct": 100}},
+        {}, None, "2026-11-06")
+    assert "10% cash, 30% long-term and 60% swing" in policy_context
+    assert "Cash can be below 10%, including zero" in policy_context
+    assert "No automatic trades or forced rebalancing" in policy_context
+    assert fm.trading_sleeve("BRK-B", {"type": "EQUITY"}) == "swing"
+    assert fm.trading_sleeve("UNKNOWN", {"type": None}) == "unclassified"
     assert cal.is_trading_day(cal.date(2026, 11, 6))
     assert not cal.is_trading_day(cal.date(2026, 11, 7))  # Saturday
     assert not cal.is_trading_day(cal.date(2026, 11, 26))  # Thanksgiving
@@ -79,8 +146,8 @@ def main() -> int:
     assert abs(fm.sleeve_fraction("SPY", "core_index", fm.DEFAULT_AI_SLEEVE) - 0.33) < 1e-9
     half = fm.resolve_ai_sleeve({"ai_sleeve": {"ticker_weight": {"AAPL": 0.5}}})
     assert half["ticker_weight"]["AAPL"] == 0.5 and half["ticker_weight"]["SPY"] == 0.33
-    assert fm._policy_with_sleeve({})["ai_sleeve_cap_pct"] == 50
-    assert fm._policy_with_sleeve({"ai_sleeve": {"cap_pct": 42}})["ai_sleeve_cap_pct"] == 42
+    assert "ai_sleeve_cap_pct" not in fm._policy_with_sleeve({})
+    assert "cap_pct" not in fm.resolve_ai_sleeve({"ai_sleeve": {"cap_pct": 42}})
     table = fm.subtheme_table([
         {"ticker": "NVDA", "sub_theme": "ai_compute_semis", "weight_pct": 12.5, "market_value": 1000},
         {"ticker": "AMD", "sub_theme": "ai_compute_semis", "weight_pct": 2.5, "market_value": 200},
@@ -104,36 +171,45 @@ def main() -> int:
     decision["trades"][1] = {"ticker": "AAPL", "action": "BUY", "shares": 1, "decision": "add"}
     check = fm.validate_trades(decision, _stats())
     text = " ".join(check["warnings"])
-    assert "below the $500 minimum" in text, text
-    assert "exceeds the 12% cap" in text, text  # NVDA stays ~50%
-    assert "AI look-through" in text and "excluded: AAPL" in text and "50%" in text, text
+    assert "trade-size indicator" not in text, text
+    assert check["ending_cash"] == 10300.0, check["ending_cash"]
+    assert "advisory position-size indicator" not in text, text
+    assert "AI look-through" not in text and "top 3" not in text, text
     assert "ATR fallback" in text, text  # NVDA and AAPL have no plan stop
     assert "earnings" in text, text
     risk = check["post_trade_risk"]
     assert risk["beta_spy"] > 1, risk
     assert abs(risk["ai_lookthrough_pct"] - 56.1) < 0.15, risk
+    assert risk["top3_pct"] > 50, risk
+    assert next(a for a in check["post_trade"] if a["ticker"] == "NVDA")["weight_after_pct"] > 40
+    assert not any(key.endswith("cap_pct") for key in check["post_trade_risk"])
     half_stats = _stats()
     half_stats["risk_policy"] = {**fm.RISK_POLICY, "ai_sleeve": half}
     half_ai = fm.validate_trades(decision, half_stats)["post_trade_risk"]["ai_lookthrough_pct"]
     assert abs(half_ai - 58.2) < 0.15, half_ai
     assert "SPY_-10pct_beta_scaled" in risk["stress"]
     assert risk["stress"]["SPY_-10pct_beta_scaled"]["pnl_usd"] < 0
+
+    # A small affordable trade is valid; available cash remains a real constraint.
+    small_trade = fm.validate_trades({
+        "cash_decision": {"target_cash_pct": 10},
+        "levels": [],
+        "trades": [{"ticker": "AAPL", "action": "BUY", "shares": 1, "decision": "add"}],
+    }, _stats())
+    assert small_trade["ending_cash"] == 9800.0, small_trade["ending_cash"]
+    assert "trade-size indicator" not in " ".join(small_trade["warnings"])
+    overspend = fm.validate_trades({
+        "cash_decision": {"target_cash_pct": 10},
+        "levels": [],
+        "trades": [{"ticker": "AAPL", "action": "BUY", "shares": 51, "decision": "add"}],
+    }, _stats())
+    assert any("overspend cash by $200" in warning for warning in overspend["warnings"]), overspend["warnings"]
     spy = next(a for a in check["post_trade"] if a["ticker"] == "SPY")
     assert spy["downside_source"] == "plan"
     nvda = next(a for a in check["post_trade"] if a["ticker"] == "NVDA")
     assert nvda["downside_source"] == "atr_fallback"
 
-    # 248 is the 1y estimation sample. Short-history caps read total history_bars.
-    established = {"ticker": "MSFT", "type": "EQUITY", "ann_vol_pct": 22,
-                   "obs_1y": 248, "history_bars": 501}
-    cap, why = fm._position_cap(established, fm.RISK_POLICY)
-    assert cap == fm.RISK_POLICY["single_stock_cap_pct"] and "248" not in why, (cap, why)
-    missing_total = {"ticker": "MSFT", "type": "EQUITY", "ann_vol_pct": 22, "obs_1y": 248}
-    cap, why = fm._position_cap(missing_total, fm.RISK_POLICY)
-    assert cap == fm.RISK_POLICY["single_stock_cap_pct"] and "248" not in why, (cap, why)
-    spcx = {"ticker": "SPCX", "type": "EQUITY", "ann_vol_pct": 40, "obs_1y": 101, "history_bars": 103}
-    cap, why = fm._position_cap(spcx, fm.RISK_POLICY)
-    assert cap == fm.RISK_POLICY["short_history_cap_pct"] and why == "history 103 bars", (cap, why)
+    # History remains available as evidence, but no inherited short-history size cap is applied.
     hist = _stats()
     hist["positions"] = [
         {"ticker": "MSFT", "quantity": 10, "price": 500, "theme": "megacap_quality",
@@ -156,9 +232,10 @@ def main() -> int:
     }
     hist_check = fm.validate_trades(hist_decision, hist)
     hist_text = " ".join(hist_check["warnings"])
-    assert "history 248" not in hist_text, hist_text
-    assert "MSFT: post-trade weight" not in hist_text, hist_text
-    assert "SPCX: post-trade weight 3.0% exceeds the 2% cap (history 103 bars)" in hist_text, hist_text
+    assert "advisory position-size indicator" not in hist_text, hist_text
+    assert "history 103 bars" not in hist_text, hist_text
+    assert any(row["ticker"] == "SPCX" and row["weight_after_pct"] == 3.0
+               for row in hist_check["post_trade"]), hist_check["post_trade"]
     bad = fm.pd.DataFrame({
         "Date": ["2026-11-04 00:00:00-05:00", "2026-11-05 00:00:00-04:00"],
         "Close": [200.0, None],
@@ -181,6 +258,8 @@ def main() -> int:
     assert fm.is_etf_instrument("DRAM", {"type": "etf"})
     assert fm.is_etf_instrument("QQQ", {})
     assert not fm.is_etf_instrument("NVDA", {"type": "EQUITY"})
+    assert not fm.is_etf_instrument("NOTE", {"type": "ETN"})
+    assert fm.trading_sleeve("NOTE", {"type": "ETN"}) == "unclassified"
     assert fm.trading_sleeve("SPY", {}) == "core_etf"
     assert fm.trading_sleeve("AAPL", {"type": "EQUITY"}) == "swing"
 
@@ -228,12 +307,22 @@ def main() -> int:
     assert next(a for a in ok_check["post_trade"] if a["ticker"] == "AAPL")["sleeve"] == "swing"
     assert next(a for a in ok_check["post_trade"] if a["ticker"] == "cash")["sleeve"] == "swing"
     warn_check = fm.validate_trades(_hold(_sleeve_book(31000)), _sleeve_book(31000))
-    assert warn_check["sleeves"]["status"] == "warn", warn_check["sleeves"]
+    assert warn_check["sleeves"]["status"] == "ok", warn_check["sleeves"]
     assert warn_check["breaches"] == [], warn_check["breaches"]
-    assert any("above the 30%" in w for w in warn_check["warnings"]), warn_check["warnings"]
+    assert not any("core ETF" in w for w in warn_check["warnings"]), warn_check["warnings"]
     breach_check = fm.validate_trades(_hold(_sleeve_book(33000)), _sleeve_book(33000))
-    assert breach_check["sleeves"]["status"] == "breach", breach_check["sleeves"]
-    assert breach_check["breaches"], breach_check
+    assert breach_check["sleeves"]["status"] == "ok", breach_check["sleeves"]
+    assert not any("core ETF" in w for w in breach_check["warnings"]), breach_check["warnings"]
+    flexible_book = _sleeve_book(60000)
+    flexible_book["account"]["cash"] = 0
+    flexible_book["cash_policy"] = {"min_pct": 0, "max_pct": 100, "soft_default_pct": 10,
+                                     "portfolio_guidance": fm.approved_portfolio_guidance(guide)}
+    flexible_plan = _hold(flexible_book)
+    flexible_plan["cash_decision"]["target_cash_pct"] = 0
+    flexible_check = fm.validate_trades(flexible_plan, flexible_book)
+    assert flexible_check["ending_cash_pct"] == 0 and not flexible_check["breaches"], flexible_check
+    assert not any("cash" in warning.lower() and "outside" in warning.lower()
+                   for warning in flexible_check["warnings"]), flexible_check["warnings"]
     etf_only = _sleeve_book(20000)
     no_stop = {
         "cash_decision": {"target_cash_pct": 20},
@@ -251,25 +340,35 @@ def main() -> int:
     assert "XLV: no stop" not in loose_text, loose_text
     assert next(t for t in loose["trades"] if t["ticker"] == "XLV")["sleeve"] == "core_etf"
 
-    plan = Path(__file__).resolve().parents[2] / "data" / "fund_manager" / "2026-11-06" / "213439_bc6b2b"
-    report = json.loads((plan / "portfolio_report.json").read_text(encoding="utf-8"))
-    saved = json.loads((plan / "portfolio_stats.json").read_text(encoding="utf-8"))
-    live = fm.validate_trades(report["final"], saved)
-    live_text = " ".join(live["warnings"])
-    assert live["sleeves"]["status"] == "ok", live["sleeves"]
-    assert abs(live["sleeves"]["core_etf"]["weight_pct"] - 26.4) < 0.25, live["sleeves"]
-    assert "core ETF sleeve" not in live_text, live_text
-    assert live["breaches"] == [], live["breaches"]
-    for ticker in ("SPY", "XLV", "XLP"):
-        row = next(a for a in live["post_trade"] if a["ticker"] == ticker)
-        assert row["sleeve"] == "core_etf" and row["shares_after"], row
-    assert next(a for a in live["post_trade"] if a["ticker"] == "V")["sleeve"] == "swing"
-    watch = json.loads((Path(__file__).resolve().parents[2] / "data" / "watchlist.json").read_text(encoding="utf-8"))
-    names = [item["ticker"] for item in watch]
-    assert len(names) == len(set(names))
-    assert 30 <= len(names) <= 50, len(names)
-    for ticker in ("QQQ", "SMH", "IWM", "XLE", "XLF", "GLD"):
-        assert ticker in names, ticker
+    context = fm.build_context(
+        {"cash": 0, "positions": []},
+        {"weights_pct": {"EXAMPLE": 90}, "approved_targets_pct": {"AAA": 25},
+         "owner_notes": "legacy unreviewed instruction", "custom_policy": {"target": 77}},
+        {"positions": [], "watchlist": []}, {}, None, "2026-11-06")
+    assert "EXAMPLE" not in context and '"weights_pct"' not in context, context
+    assert "legacy unreviewed instruction" not in context and '"custom_policy"' not in context, context
+    assert '"approved_targets_pct"' in context and '"AAA": 25' in context, context
+    assert "held for weeks to months" not in fm.FM_SYSTEM and "held for weeks to months" not in fm.ANALYST_TASK
+    assert "otherwise do not invent allocation percentages" in fm.FM_SYSTEM
+    assert "Do not apply swing-trading rules or tight stops to ETFs" not in fm.FM_SYSTEM
+    assert "Do not apply swing-trading rules or tight stops to ETFs" not in fm.ANALYST_TASK
+    assert "investment_role" in fm.TRADE_ITEM["properties"]
+    scout_context = fm.build_context(
+        {"cash": 0, "positions": []}, {},
+        {"positions": [], "watchlist": [], "report_sources": {"AAA": {"status": "stale", "source_date": "2026-10-28"}}},
+        {}, None, "2026-11-06", {"status": "reused", "date": "2026-11-02", "age_days": 4,
+                                 "report": {"ranking": [{"ticker": "AAA", "rank": 1}]}})
+    assert '"status": "stale"' in scout_context and '"status": "reused"' in scout_context
+    assert '"ticker": "AAA"' in scout_context and "Dated theme scout report" in scout_context
+    rendered = []
+    fm.render_plan_trades(rendered, {"priority_order": []}, {
+        "trades": [], "post_trade": [{"ticker": "AAA", "shares_after": 1, "value_after": 100,
+                                        "weight_after_pct": 25, "is_new": False}], "warnings": [],
+        "ending_cash": 0, "ending_cash_pct": 0,
+    }, {"weights_pct": {"EXAMPLE": 90}, "approved_targets_pct": {"AAA": 25}})
+    rendered_text = "\n".join(rendered)
+    assert "Owner-approved target" in rendered_text and "25.0%" in rendered_text
+    assert "EXAMPLE" not in rendered_text and "Target (guidance)" not in rendered_text
     import pandas as pd
     idx = pd.bdate_range("2025-10-01", "2025-11-06")
     close = pd.DataFrame({"SPY": [100 + i for i in range(len(idx))]}, index=idx)
@@ -278,9 +377,7 @@ def main() -> int:
     assert quotes["SPY"]["price"] == close["SPY"].iloc[-1]
     assert "live" not in (quotes["SPY"]["source"] or "")
     print("check_offline: ok")
-    print(f"  plan 213439 core ETF {live['sleeves']['core_etf']['weight_pct']}% "
-          f"swing {live['sleeves']['swing']['weight_pct']}% status {live['sleeves']['status']}")
-    print(f"  watchlist {len(names)} names")
+    print(f"  configured safeguard states {warn_check['sleeves']['status']}/{breach_check['sleeves']['status']}")
     print(f"  speaking {order_a} vs {order_b}")
     print(f"  post-trade beta {risk['beta_spy']} AI {risk['ai_lookthrough_pct']}%")
     return 0

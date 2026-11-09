@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -12,8 +13,47 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cost_ledger as cl
 
 
+def check_disabled_weekly_budget() -> None:
+    policy = cl.budget_policy({"weekly_budget_usd": 25, "budget": {"enabled": False}})
+    assert policy["weekly_usd"] == 25
+    assert policy["enabled"] is False
+    result = cl.gate(1000, 500, policy["weekly_usd"], policy["enabled"])
+    assert result["ok"] is True and result["enabled"] is False
+    enabled = cl.gate(24, 2, 25, True)
+    assert enabled["ok"] is False and enabled["enabled"] is True
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        targets_path = root / "targets.json"
+        targets_path.write_text(json.dumps({"weekly_budget_usd": 25, "budget": {"enabled": False}}))
+        evaluated = cl.evaluate(root, datetime.now(timezone.utc).date(), "manifest",
+                                json.loads(targets_path.read_text()), 1000)
+        assert evaluated["ok"] is True and evaluated["enabled"] is False
+        command = [sys.executable, str(Path(cl.__file__)), "--data-root", str(root),
+                   "--kind", "manifest", "--next", "1000"]
+        disabled = subprocess.run(command, text=True, capture_output=True)
+        assert disabled.returncode == 0, disabled.stderr
+        assert "limit=disabled" in disabled.stdout and "ok=true" in disabled.stdout
+        targets_path.write_text(json.dumps({"weekly_budget_usd": 25, "budget": {"enabled": True}}))
+        enabled = subprocess.run(command, text=True, capture_output=True)
+        assert enabled.returncode == 4, enabled.stdout + enabled.stderr
+        assert "limit=$25.00" in enabled.stdout and "ok=false" in enabled.stdout
+
+
 def main() -> int:
     rows = cl.load_models()
+    newly_listed = {
+        "deepseek/deepseek-v4.1-flash-1017",
+        "moonshotai/kimi-k3",
+        "moonshotai/kimi-k3.1-pro",
+        "google/gemini-4-argon",
+        "openai/gpt-6.1-terra",
+        "openai/gpt-6-astra",
+    }
+    model_ids = {row["id"] for row in rows}
+    assert newly_listed <= model_ids
+    for row in rows:
+        if row["id"] in newly_listed:
+            assert row.get("usd_per_mtok_in") is None and row.get("usd_per_mtok_out") is None
     assert cl.price_tokens("openai/gpt-6.1-sol", 1_000_000, 0, rows) == 2.5
     assert cl.price_tokens("openai/gpt-6-luna", 1_000_000, 1_000_000, rows) == 0.625
     assert cl.price_tokens("anthropic/claude-opus-5.5", 1_000_000, 1_000_000, rows) == 24.0
@@ -22,6 +62,25 @@ def main() -> int:
     table = cl.cost_from_usage("openai/gpt-6.1-sol", {"prompt_tokens": 2_000_000, "completion_tokens": 0}, rows)
     assert table["cost_usd"] == 5.0 and table["cost_source"] == "price_table"
     assert cl.price_tokens("missing/model", 100, 100, rows) is None
+
+    # Model-call labels contain slashes; filenames must stay in the ledger folder,
+    # while JSON retains the original label and weekly accounting sees each call once.
+    label_root = Path(tempfile.mkdtemp(prefix="cost_ledger_labels_"))
+    labels = ["fm/draft", "risk/aggressive r1", "NVDA", "../../outside"]
+    expected_prefixes = ["fm_draft", "risk_aggressive_r1", "NVDA", "outside"]
+    for index, (label, expected_prefix) in enumerate(zip(labels, expected_prefixes), start=1):
+        written = cl.write_chat_cost(label_root, label=label, model="openai/gpt-6.1-sol",
+                                     usage={"prompt_tokens": 0, "completion_tokens": 0,
+                                            "cost": index / 10},
+                                     analysis_date="2026-11-09")
+        assert written is not None and written.parent == cl.costs_dir(label_root), written
+        assert written.name.startswith(expected_prefix), written.name
+        saved = json.loads(written.read_text(encoding="utf-8"))
+        assert saved["label"] == label and saved["ticker"] == label, saved
+    label_records = cl.load_cost_records(label_root)
+    assert len(label_records) == len(labels), label_records
+    label_week = cl.weekly_spend(label_root, datetime.now(timezone.utc).date())
+    assert label_week["spent_usd"] == 1.0 and len(label_week["runs"]) == len(labels), label_week
 
     root = Path(tempfile.mkdtemp(prefix="cost_ledger_"))
     targets = {"budget": {"weekly_usd": 25, "native_run_estimate_usd": 2, "fund_manager_estimate_usd": 1.5}}
@@ -75,4 +134,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    check_disabled_weekly_budget()
     sys.exit(main())

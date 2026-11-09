@@ -49,7 +49,6 @@ DEFAULT_AI_SLEEVE = {
         "AAPL": 0.0, "MSFT": 1.0, "GOOG": 1.0, "GOOGL": 1.0, "SPY": 0.33,
         "QQQ": 0.50, "SMH": 1.0, "IWM": 0.0, "XLE": 0.0, "XLF": 0.0, "GLD": 0.0,
     },
-    "cap_pct": 50.0,
 }
 SUBTHEMES = (
     ("ai_energy", "AI energy"),
@@ -60,21 +59,11 @@ SUBTHEMES = (
     ("physical_ai", "Physical AI"),
 )
 RISK_POLICY = {
-    "single_stock_cap_pct": 12.0,
-    "high_vol_cap_pct": 3.0,
-    "high_vol_threshold_pct": 60.0,
-    "short_history_cap_pct": 2.0,
-    "short_history_bars": 252,
-    "broad_index_cap_pct": 35.0,
-    "ai_sleeve_cap_pct": 50.0,
     "ai_sleeve": DEFAULT_AI_SLEEVE,
-    "top3_cap_pct": 50.0,
-    "min_trade_usd": 500.0,
     "earnings_warn_days": 7,
-    # Core ETF sleeve is ~30% of the account. Above 30 warns; above 32 breaches.
-    # The rest is the swing sleeve: single stocks plus cash reserved for swings.
-    "core_etf_warn_pct": 30.0,
-    "core_etf_breach_pct": 32.0,
+    # Retained for legacy reports; instrument type is not the owner's investment role.
+    "core_etf_warn_pct": 100.0,
+    "core_etf_breach_pct": 100.0,
 }
 # Used when a holding has no quote type. Any instrument whose type is etf counts too.
 KNOWN_ETFS = frozenset({
@@ -92,6 +81,38 @@ def load_json(path: Path, default=None):
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     return default
+
+
+def approved_target_weights(targets: dict | None) -> dict:
+    """Return only allocation weights explicitly approved by the owner.
+
+    Older targets.json files may contain `weights_pct` copied from the example
+    template. Preserve those files, but never treat those example values as an
+    investment mandate.
+    """
+    raw = (targets or {}).get("approved_targets_pct")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(ticker): float(weight) for ticker, weight in raw.items()
+            if isinstance(weight, (int, float)) and not isinstance(weight, bool)
+            and math.isfinite(float(weight)) and 0 <= float(weight) <= 100}
+
+
+def approved_portfolio_guidance(targets: dict | None) -> dict | None:
+    """Read the owner's explicitly approved soft portfolio mix, if configured."""
+    raw = (targets or {}).get("portfolio_guidance")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        values = {key: float(raw[key]) for key in
+                  ("cash_reference_pct", "long_term_pct", "swing_pct")}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (not all(math.isfinite(v) and 0 <= v <= 100 for v in values.values())
+            or abs(sum(values.values()) - 100) > 0.01):
+        return None
+    return {**values, "cash_is_soft": True, "force_rebalance": False,
+            "sector_weights_are_guidelines": True, "swing_horizon": "flexible"}
 
 
 def find_latest_reports(reports_dir: Path, tickers: list[str], since: str | None) -> dict:
@@ -194,6 +215,75 @@ def parse_report(tk: str, d: Path, include_risk: bool, max_chars: int) -> dict:
             for k in ("aggressive", "conservative", "neutral")
         }
     return out
+
+
+REPORT_FRESH_DAYS = 7
+
+
+def source_freshness(report: dict | None, as_of: str, max_age_days: int = REPORT_FRESH_DAYS) -> dict:
+    """Label a reused report by its source date; unknown dates fail closed as unknown."""
+    if not report:
+        return {"status": "missing", "source_date": None, "age_days": None}
+    source_date = report.get("analysis_date")
+    if not source_date and report.get("generated_utc"):
+        try:
+            source_date = datetime.fromisoformat(str(report["generated_utc"].replace("Z", "+00:00"))).date().isoformat()
+        except (TypeError, ValueError):
+            source_date = None
+    if not source_date:
+        match = re.search(r"_(\d{8})_\d{6}$", str(report.get("report_dir") or ""))
+        if match:
+            source_date = f"{match.group(1)[:4]}-{match.group(1)[4:6]}-{match.group(1)[6:8]}"
+    try:
+        age = (datetime.strptime(as_of, "%Y-%m-%d").date()
+               - datetime.strptime(str(source_date), "%Y-%m-%d").date()).days
+    except (TypeError, ValueError):
+        return {"status": "unknown", "source_date": source_date, "age_days": None}
+    if age < 0:
+        status = "future"
+    elif age == 0:
+        status = "current"
+    elif age <= max_age_days:
+        status = "reused"
+    else:
+        status = "stale"
+    return {"status": status, "source_date": source_date, "age_days": age}
+
+
+def load_scout_report(scout_dir: Path, as_of: str, max_age_days: int = REPORT_FRESH_DAYS) -> dict:
+    """Load the latest dated scout report no later than the portfolio decision date."""
+    candidates = []
+    if scout_dir.is_dir():
+        for folder in scout_dir.iterdir():
+            if folder.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", folder.name) and folder.name <= as_of:
+                report_path = folder / "report.json"
+                if report_path.is_file():
+                    candidates.append((folder.name, report_path))
+    if not candidates:
+        return {"status": "missing", "date": None, "age_days": None, "report": None}
+    day, path = max(candidates, key=lambda row: row[0])
+    try:
+        report = load_json(path, {})
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"status": "unavailable", "date": day, "age_days": None,
+                "error": f"Could not read scout report: {exc}", "report": None}
+    if not isinstance(report, dict):
+        return {"status": "unavailable", "date": day, "age_days": None,
+                "error": "Theme scout report root must be a JSON object", "report": None}
+    freshness = source_freshness({"analysis_date": day}, as_of, max_age_days)
+    selected = {key: report.get(key) for key in (
+        "headline", "macro", "headlines", "relative_strength", "themes", "ranking",
+        "screen", "discovery_pool", "changes", "sectors", "ranking_errors", "ranking_status",
+        "ranking_count", "ranking_expected_count", "ranking_missing_tickers", "ranking_warnings",
+        "model_skipped")
+        if report.get(key) is not None}
+    # The full scout ranking preserves all holdings and makes partial coverage
+    # counts meaningful to downstream portfolio analysis.
+    for key, limit in (("headlines", 20), ("screen", 30),
+                       ("discovery_pool", 30), ("changes", 40)):
+        if isinstance(selected.get(key), list):
+            selected[key] = selected[key][:limit]
+    return {**freshness, "date": day, "generated_utc": report.get("generated_utc"), "report": selected}
 
 
 # --------------------------------------------------------------------------- market data
@@ -392,7 +482,8 @@ def load_watchlist(path: Path, held: list[str]) -> list[dict]:
     """Accepts a list of tickers / dicts, or {"candidates"|"watchlist"|"tickers": [...]}."""
     raw = load_json(path, [])
     if isinstance(raw, dict):
-        raw = raw.get("candidates") or raw.get("watchlist") or raw.get("tickers") or []
+        raw = next((raw.get(key) for key in ("items", "candidates", "watchlist", "tickers")
+                    if isinstance(raw.get(key), list)), [])
     out, seen = [], set()
     for item in raw or []:
         if isinstance(item, str):
@@ -513,14 +604,13 @@ def resolve_ai_sleeve(targets: dict | None) -> dict:
     for k, v in (raw.get("ticker_weight") or {}).items():
         tick[str(k).strip().upper()] = float(v)
     out = {"theme_weight": theme, "ticker_weight": tick}
-    out["cap_pct"] = float(raw["cap_pct"]) if raw.get("cap_pct") is not None else float(DEFAULT_AI_SLEEVE["cap_pct"])
     if raw.get("as_of"):
         out["as_of"] = str(raw["as_of"])
     return out
 
 
 def is_etf_instrument(ticker: str, info: dict | None = None) -> bool:
-    """True for any ETF. Type comes from the watchlist or from Yahoo's quote type."""
+    """True for an identified ETF; unknown quote types are not inferred as ETFs."""
     kind = str((info or {}).get("type") or "").strip().lower()
     if kind == "etf":
         return True
@@ -528,10 +618,15 @@ def is_etf_instrument(ticker: str, info: dict | None = None) -> bool:
 
 
 def trading_sleeve(ticker: str, info: dict | None = None) -> str:
-    """core_etf for ETFs held weeks to months. swing for single stocks and cash."""
+    """Analysis grouping by instrument, not an owner-approved investment role."""
     if str(ticker or "").strip().upper() in {"", "CASH"}:
         return "swing"
-    return "core_etf" if is_etf_instrument(ticker, info) else "swing"
+    if is_etf_instrument(ticker, info):
+        return "core_etf"
+    kind = str((info or {}).get("type") or "").strip().lower()
+    if kind in {"equity", "stock"}:
+        return "swing"
+    return "unclassified"
 
 
 def _sleeve_book(rows: list[dict], cash: float, total: float) -> dict:
@@ -539,9 +634,10 @@ def _sleeve_book(rows: list[dict], cash: float, total: float) -> dict:
     out = {
         "core_etf": {"weight_pct": 0.0, "market_value": 0.0, "cost_basis": 0.0, "unrealized_pnl": 0.0},
         "swing": {"weight_pct": 0.0, "market_value": 0.0, "cost_basis": 0.0, "unrealized_pnl": 0.0},
+        "unclassified": {"weight_pct": 0.0, "market_value": 0.0, "cost_basis": 0.0, "unrealized_pnl": 0.0},
     }
     for r in rows:
-        bucket = out[r.get("sleeve") if r.get("sleeve") in out else "swing"]
+        bucket = out[r.get("sleeve") if r.get("sleeve") in out else "unclassified"]
         bucket["weight_pct"] += r.get("weight_pct") or 0
         bucket["market_value"] += r.get("market_value") or 0
         bucket["cost_basis"] += r.get("cost_basis") or 0
@@ -587,7 +683,7 @@ def sleeve_label(sleeve: dict | None) -> str:
 
 def _policy_with_sleeve(targets: dict | None) -> dict:
     sleeve = resolve_ai_sleeve(targets)
-    policy = {**RISK_POLICY, "ai_sleeve": sleeve, "ai_sleeve_cap_pct": float(sleeve["cap_pct"])}
+    policy = {**RISK_POLICY, "ai_sleeve": sleeve}
     spy = float((sleeve.get("ticker_weight") or {}).get(BENCH, 0.33))
     policy["spy_tech_share"] = spy
     policy["ai_megacap"] = sorted(
@@ -687,6 +783,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     rows = []
     for p in positions:
         tk, qty, avg = p["ticker"], float(p["quantity"]), float(p["average_price"])
+        report_age = source_freshness(reports.get(tk), anchor.isoformat())
         px = quotes.get(tk, {}).get("price")
         mv = qty * px if px else None
         th = theme_of(tk, themes)
@@ -696,7 +793,11 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                      "unrealized_pnl": (mv - qty * avg) if mv is not None else None,
                      "unrealized_pnl_pct": ((px / avg - 1) * 100) if px and avg else None,
                      "theme": th, "sub_theme": subtheme_of(tk, themes),
-                     "bucket": bucket_of(th, themes), **(meta.get(tk) or {})})
+                     "bucket": bucket_of(th, themes),
+                     "agent_report_status": report_age["status"],
+                     "agent_report_date": report_age["source_date"],
+                     "agent_report_age_days": report_age["age_days"],
+                     **(meta.get(tk) or {})})
     invested = sum(r["market_value"] or 0 for r in rows)
     total = invested + cash
     for r in rows:
@@ -710,6 +811,19 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     bench2 = win2[BENCH] if BENCH in win2 else None
 
     data_checks = []
+    report_sources = {}
+    expected_reports = [str(ticker) for ticker in tickers] + [row["ticker"] for row in watchlist]
+    for ticker in dict.fromkeys(expected_reports):
+        freshness = source_freshness(reports.get(ticker), anchor.isoformat())
+        report_sources[ticker] = {**freshness, "report_dir": (reports.get(ticker) or {}).get("report_dir")}
+        if freshness["status"] == "reused":
+            data_checks.append(f"{ticker}: reusing ticker report from {freshness['source_date']} ({freshness['age_days']} days old)")
+        elif freshness["status"] == "stale":
+            data_checks.append(f"{ticker}: ticker report is stale ({freshness['source_date']}, {freshness['age_days']} days old)")
+        elif freshness["status"] == "missing":
+            data_checks.append(f"{ticker}: no ticker analysis report is available")
+        elif freshness["status"] in {"unknown", "future"}:
+            data_checks.append(f"{ticker}: ticker report date is {freshness['status']} ({freshness.get('source_date')})")
     per = {}
     for tk in dict.fromkeys(tickers + [BENCH]):
         if tk not in win1:
@@ -794,7 +908,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     corr = win1[[t for t in tickers if t in win1]].corr().round(2)
 
     drift = None
-    tw = (targets or {}).get("weights_pct", {})
+    tw = approved_target_weights(targets)
     if tw:
         drift = []
         for r in rows:
@@ -804,10 +918,11 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
             drift.append({"ticker": r["ticker"], "current_pct": round(r["weight_pct"], 1), "target_pct": t,
                           "drift_pct": round(r["weight_pct"] - t, 1),
                           "shares_to_target": int(round((t / 100 * total - (r["market_value"] or 0)) / r["price"]))})
+        guidance = cash_policy.get("portfolio_guidance") or {}
+        cash_reference = guidance.get("cash_reference_pct", cash_policy["soft_default_pct"])
         drift.append({"ticker": "cash", "current_pct": round(cash / total * 100, 1),
-                      "target_pct": f"dynamic ({cash_policy['min_pct']}-{cash_policy['max_pct']}%, soft default "
-                                    f"{cash_policy['soft_default_pct']}%)",
-                      "drift_pct": round(cash / total * 100 - cash_policy["soft_default_pct"], 1)})
+                      "target_pct": f"dynamic guideline ({cash_reference}% reference; 0-100% allowed)",
+                      "drift_pct": round(cash / total * 100 - cash_reference, 1)})
 
     # market regime
     regime = {}
@@ -863,8 +978,12 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     top_risk = contrib.sort_values(ascending=False).index[0] if len(contrib) else None
     for c in watchlist:
         tk = c["ticker"]
+        report_age = source_freshness(reports.get(tk), anchor.isoformat())
         ent = {**c, "sleeve": trading_sleeve(tk, c), "price": quotes.get(tk, {}).get("price"),
                "has_agent_report": tk in reports,
+               "agent_report_status": report_age["status"],
+               "agent_report_date": report_age["source_date"],
+               "agent_report_age_days": report_age["age_days"],
                "sub_theme": c.get("sub_theme") or subtheme_of(tk, themes),
                "agent_rating": reports.get(tk, {}).get("pm_rating") if tk in reports else None,
                **({k: v for k, v in (meta.get(tk) or {}).items() if k == "name"})}
@@ -924,6 +1043,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                           "by_bucket_pct": {k: round(v, 1) for k, v in by_bucket.items()}},
         "regime": regime,
         "risk_policy": _policy_with_sleeve(targets),
+        "report_sources": report_sources,
         "correlation_matrix": corr.to_dict(),
         "correlation_clusters": correlation_clusters(corr.drop(index=BENCH, columns=BENCH, errors="ignore"), corr_threshold),
         "correlation_threshold": corr_threshold,
@@ -948,9 +1068,11 @@ Rules:
 2. For EVERY holding decide keep / trim / exit / add, with exact WHOLE-SHARE trades. Never sell more than
    held. No shorting, options or margin; ending cash >= 0. Use the provided prices.
 3. Weigh each single-stock PM view against portfolio context. You may size differently or override; say so.
-4. Owner target weights are GUIDANCE. Cash is NOT fixed: choose a target cash % each run inside the
-   cash_policy band, from the market regime (VIX, SPY vs SMA50/200, realized vol, drawdown), FRED macro,
-   stress results, and the opportunity set (agent ratings, candidate quality). The soft default is only a
+4. Only `approved_targets_pct` contains owner-approved allocation targets; absent entries are not mandates.
+   Cash is NOT fixed: choose a proposed target cash % each run. The approved cash reference is a guideline,
+   not a minimum; 0% cash is allowed when justified. Consider
+   the market regime (VIX, SPY vs SMA50/200, realized vol, drawdown), FRED macro,
+   stress results, and the opportunity set (agent ratings, candidate quality). The cash reference is only a
    starting point. Justify the level and give concrete conditions to deploy or raise cash. Your trades must
    actually land near your stated cash target (within ~3 points) unless you explain staged deployment.
 5. Consider swaps: whether freed cash is better used in watchlist candidates (stocks or sector ETFs) than
@@ -960,22 +1082,35 @@ Rules:
 6. Prioritise execution (risk reduction before adds). Give a numeric stop_or_reassess for every name you keep.
    If you omit one, code fills the supplied atr_stop and warns. atr_stop is a close-to-close ATR proxy, not a hard stop.
 7. State what evidence would change your mind. Be concrete, numeric, honest about data gaps.
-8. `risk_policy` is enforced in code after your plan (it does not rewrite share counts). Stay inside it:
-   single-stock cap, a tighter cap when volatility is high or history is short, broad-index cap,
-   top-3 cap, minimum trade size, and the AI sleeve cap. Sleeve membership is `risk_policy.ai_sleeve`
-   (from targets.json): theme_weight applies to a theme, and ticker_weight overrides it. A weight of 0
-   excludes that ticker even when its theme would count. Do not treat an excluded name as AI exposure.
-   `ai_sleeve_cap_pct` comes from targets.json (`ai_sleeve.cap_pct`). `ai_subthemes` is direct holding
-   weight by sub-theme and is not itself the look-through cap.
-   Flag earnings inside earnings_warn_days rather than adding into them. Regime values carry their dates;
+8. Concentration, single-name weights, volatility, history length, broad-index weight, and AI look-through
+   are descriptive risk context, not inherited percentage targets or owner-imposed limits. Compare the
+   actual exposures with the evidence, sector opportunities, and downside scenarios; explain material risks
+   in context without trying to satisfy an arbitrary percentage. Sleeve membership and AI look-through remain
+   analytical context: `theme_weight` applies to a theme and
+   `ticker_weight` overrides it; unknown exposure is not automatically 100% AI. These metrics do not rank
+   or exclude opportunities by themselves.
+   Keep actual execution constraints: do not short, use options or margin, spend more cash than is
+   available, sell more shares than held, or propose an unaffordable whole-share trade. `ai_subthemes`
+   describes direct holding weight by sub-theme, not a spending or allocation limit.
+   Flag earnings inside earnings_warn_days and assess gap/event risk. Explain whether to enter before the
+   event, wait until after it, or reduce exposure, with the supporting evidence and proposed size; an
+   upcoming earnings date is a risk factor, not an automatic ban on an otherwise supported opportunity.
+   Regime values carry their dates;
    a stale flag means the print is older than one session (or one release for monthly series).
-9. Core ETF sleeve vs swing sleeve. An ETF (quote type etf, including SPY, QQQ, SMH, IWM, XLE, XLF,
+9. Core ETF and swing are analysis groupings by instrument type, not owner-approved investment roles.
+   Unknown instruments are unclassified; do not infer stock, ETF, or role from missing quote type. An ETF
+   (quote type etf, including SPY, QQQ, SMH, IWM, XLE, XLF,
    GLD, XLV, XLP, and any other ETF) is sleeve `core_etf`. Single stocks and cash are sleeve `swing`.
-   The core ETF sleeve is about 30% of the account: above 30% (`core_etf_warn_pct`) is a warning, above
-   32% (`core_etf_breach_pct`) is a breach. The remaining ~70% is the swing sleeve (single stocks plus
-   cash reserved for swings). ETFs are held for weeks to months. Do not apply swing-trading rules or
-   tight stops to them. A reassessment level over that horizon is enough; omitting a tight stop on an
-   ETF is not a breach. Each position and candidate already carries `sleeve`.
+    Instrument sleeves do not determine investment role. When owner soft guidance is provided in context,
+    use it as a guideline; otherwise do not invent allocation percentages. ETFs may have either proposed role.
+    Set `investment_role` for every trade to `long_term`, `swing`, or `unassigned`.
+    Choose reassessment or exit conditions from the proposed role and evidence, not from ETF/stock identity.
+    A swing-role ETF can have swing entry and invalidation conditions; a long-term ETF can have a thesis-based
+    reassessment condition. Do not invent tight price stops when evidence does not support them. State the
+    assumption and explain unassigned roles. Each position and candidate already carries `sleeve`.
+10. Check `report_sources` and `scout_source` before relying on reused evidence. Ticker reports older than
+    seven calendar days are marked stale; missing, undated, future-dated, and stale reports are evidence gaps.
+    Treat scout rankings and ideas as dated research context, never as approved watchlist changes.
 This is decision support, not financial advice."""
 
 ANALYST_ROLES = {
@@ -993,10 +1128,10 @@ adjustments that best improve risk-adjusted outcome.""",
 }
 ANALYST_TASK = """Critique the Fund Manager's DRAFT plan using the whole-portfolio stats (correlation clusters,
 1y/2y beta, VaR, risk contribution, stress tests, concentration, target drift, regime, macro) and the
-watchlist candidates. Debate the CASH level explicitly (give your own target cash %, inside the band).
-The core ETF sleeve (any ETF) should stay near 30% of the account: above 30% warns and above 32%
-breaches. The other ~70% is the swing sleeve (single stocks plus cash reserved for swings). ETFs are
-held for weeks to months, so do not ask for swing rules or tight stops on them.
+watchlist candidates. Debate the CASH level explicitly (give your own target cash %, justified against any
+soft owner guidance). Core ETF and swing are analysis groupings by instrument type, not owner-approved roles.
+Review investment roles and reassessment conditions from the proposed role and evidence, regardless of
+instrument type. Do not invent a tight stop without evidence.
 Respond directly to the other analysts' earlier points where present. Propose specific whole-share changes
 (ticker, action, shares) or say 'no change'. Be concise and numeric (<= ~500 words of content)."""
 
@@ -1012,6 +1147,7 @@ ARR_S = {"type": "array", "items": S}
 TRADE_ITEM = _obj({
     "ticker": S,
     "is_holding": {"type": "boolean"},
+    "investment_role": {"type": "string", "enum": ["long_term", "swing", "unassigned"]},
     "decision": {"type": "string", "enum": ["keep", "trim", "exit", "add", "new_position", "pass"]},
     "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
     "shares": {**I, "description": "whole shares; 0 for HOLD"},
@@ -1053,22 +1189,42 @@ ANALYST_SCHEMA = _obj({
 })
 
 
-def build_context(book, targets, stats, reports, macro, as_of) -> str:
+def build_context(book, targets, stats, reports, macro, as_of, scout_report: dict | None = None) -> str:
     slim_pos = [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items() if k != "price_source"}
                 for r in stats["positions"]]
     stats_view = {k: v for k, v in stats.items() if k not in ("positions", "watchlist")}
+    # Only the explicitly approved target field belongs in owner-policy context.
+    # Cash, risk, AI-sleeve and budget settings are surfaced separately as
+    # configured safeguards, never as owner-approved mandates.
+    approved_targets = approved_target_weights(targets)
+    owner_policy = {"approved_targets_pct": approved_targets} if approved_targets else {}
+    guidance = approved_portfolio_guidance(targets)
+    if guidance:
+        owner_policy["portfolio_guidance"] = guidance
     parts = [
         f"# Fund review - decision date {as_of}",
         "## Book (shares, average cost, cash)", json.dumps(book, indent=1),
-        "## Owner target weights (GUIDANCE ONLY; cash entry is a soft default, cash target is dynamic)",
-        json.dumps(targets, indent=1) if targets else "none provided",
+        "## Owner-approved allocation targets and soft portfolio guidance (missing fields are not mandates)",
+        json.dumps(owner_policy, indent=1) if owner_policy else "none provided",
         "## Positions with live prices and per-stock stats", json.dumps(slim_pos, indent=1),
-        "## Portfolio-level quantitative stats, regime and cash policy", json.dumps(stats_view, indent=1),
+        "## Portfolio-level quantitative stats, regime and configured safeguards", json.dumps(stats_view, indent=1),
+        "## Dated theme scout report and freshness (ideas and ranking are evidence, not approved changes)",
+        json.dumps(scout_report or {"status": "missing", "date": None, "report": None}, indent=1),
         "## Macro snapshot (FRED, latest values)", json.dumps(macro, indent=1) if macro else "not fetched",
         "## Watchlist candidates (NOT held)",
         json.dumps(stats["watchlist"], indent=1) if stats["watchlist"] else "none",
         "## Single-stock agent decisions (latest TradingAgents run per ticker)",
     ]
+    if guidance:
+        parts.insert(4, "## Owner-approved portfolio guidelines (soft, not a rebalance mandate)\n"
+                     f"Use {guidance['cash_reference_pct']:g}% cash, {guidance['long_term_pct']:g}% long-term and "
+                     f"{guidance['swing_pct']:g}% swing as a starting mix of the whole account. "
+                     f"Cash can be below {guidance['cash_reference_pct']:g}%, including zero, when opportunities justify it; "
+                     "state the reason and reduced flexibility. Recommend long-term or swing roles from each holding's "
+                     "evidence, regardless of whether it is a stock or ETF. Sector weights are guidelines, not "
+                     "equal-weight requirements. No automatic trades or forced rebalancing. For swing ideas, give a "
+                     "flexible horizon, entry conditions, position-size rationale and invalidation/exit conditions. "
+                     "Discuss market protection and diversification without claiming downturns can be reliably predicted.")
     for tk, r in reports.items():
         tag = "HOLDING" if tk in {p["ticker"] for p in book["positions"]} else "CANDIDATE"
         parts.append(f"### [{tag}] {tk} - PM rating: {r['pm_rating']} | trader: {r['trader_action']} "
@@ -1171,28 +1327,6 @@ def _beta_of(info: dict) -> tuple[float, str]:
     return 1.0, "assumed 1.0 (no beta)"
 
 
-def _history_bars(info: dict) -> int | None:
-    """Total price bars. obs_1y is the 1-year estimation sample and is not a substitute."""
-    raw = info.get("history_bars")
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
-        return None
-    return int(raw)
-
-
-def _position_cap(info: dict, policy: dict) -> tuple[float, str]:
-    theme = info.get("theme")
-    kind = (info.get("type") or "").lower()
-    if theme == "core_index" or (kind == "etf" and info.get("ticker") in (None, BENCH)) or info.get("ticker") == BENCH:
-        return policy["broad_index_cap_pct"], "broad index"
-    bars = _history_bars(info)
-    if bars is not None and bars < policy["short_history_bars"]:
-        return policy["short_history_cap_pct"], f"history {bars} bars"
-    vol = info.get("ann_vol_pct")
-    if isinstance(vol, (int, float)) and vol > policy["high_vol_threshold_pct"]:
-        return policy["high_vol_cap_pct"], f"vol {vol}%"
-    return policy["single_stock_cap_pct"], "single name"
-
-
 def _stop_number(value) -> float | None:
     if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
         return float(value)
@@ -1210,7 +1344,6 @@ def validate_trades(decision: dict, stats: dict) -> dict:
     new_qty = {tk: r["quantity"] for tk, r in pos.items()}
     prices = {}
     seen = set()
-    min_trade = float(policy["min_trade_usd"])
     for t in decision.get("trades", []):
         tk = t.get("ticker")
         info = _info_for(tk, pos, wl)
@@ -1239,8 +1372,6 @@ def validate_trades(decision: dict, stats: dict) -> dict:
         elif act == "BUY":
             new_qty[tk] = new_qty.get(tk, 0) + sh
             cash -= sh * px
-        if act in ("BUY", "SELL") and sh > 0 and sh * px < min_trade:
-            warnings.append(f"{tk}: {act} {sh} is ${sh * px:,.0f}, below the ${min_trade:,.0f} minimum trade")
         decision_name = (t.get("decision") or "").lower()
         if decision_name in ("trim", "exit") and act != "SELL":
             warnings.append(f"{tk}: decision {decision_name} but action is {act}")
@@ -1250,6 +1381,8 @@ def validate_trades(decision: dict, stats: dict) -> dict:
             warnings.append(f"{tk}: staged order is counted as filled in the post-trade cash and risk figures")
         seen.add(tk)
         rows.append({**t, "shares": sh, "value_usd": round(sh * px, 2), "calc_price": round(px, 2),
+                     "investment_role": t.get("investment_role") if t.get("investment_role") in
+                     {"long_term", "swing", "unassigned"} else "unassigned",
                      "sleeve": trading_sleeve(tk, info)})
     missing = [tk for tk in pos if tk not in seen]
     if missing:
@@ -1260,7 +1393,7 @@ def validate_trades(decision: dict, stats: dict) -> dict:
     tgt = (decision.get("cash_decision") or {}).get("target_cash_pct")
     if tgt is not None:
         if not (pol["min_pct"] <= tgt <= pol["max_pct"]):
-            warnings.append(f"target cash {tgt}% is outside the policy band {pol['min_pct']}-{pol['max_pct']}%")
+            warnings.append(f"proposed cash {tgt}% is outside the configured safeguard range {pol['min_pct']}-{pol['max_pct']}%")
         if abs(cash_pct - tgt) > 3:
             warnings.append(f"post-trade cash {cash_pct:.1f}% differs from stated target {tgt}% by more than 3 points")
 
@@ -1284,9 +1417,6 @@ def validate_trades(decision: dict, stats: dict) -> dict:
         if beta_src.startswith("assumed") and q:
             assumed.append(tk)
         beta_w += (value / total) * beta if total else 0
-        cap, why = _position_cap({**info, "ticker": tk}, policy)
-        if weight > cap + 0.05 and q:
-            warnings.append(f"{tk}: post-trade weight {weight:.1f}% exceeds the {cap:.0f}% cap ({why})")
         frac = sleeve_fraction(tk, info.get("theme"), policy.get("ai_sleeve"))
         if frac and q:
             ai += weight * frac
@@ -1323,15 +1453,8 @@ def validate_trades(decision: dict, stats: dict) -> dict:
                       "downside": downside, "downside_source": downside_src})
     if assumed:
         warnings.append("post-trade beta uses 1.0 for: " + ", ".join(assumed))
-    if ai > policy["ai_sleeve_cap_pct"] + 0.05:
-        warnings.append(
-            f"AI look-through {ai:.1f}% exceeds the {policy['ai_sleeve_cap_pct']:.0f}% sleeve cap "
-            f"({sleeve_label(policy.get('ai_sleeve'))})")
     ranked = sorted((a for a in after if a["shares_after"]), key=lambda a: -a["weight_after_pct"])
     top3 = sum(a["weight_after_pct"] for a in ranked[:3])
-    if top3 > policy["top3_cap_pct"] + 0.05:
-        names = ", ".join(a["ticker"] for a in ranked[:3])
-        warnings.append(f"top 3 ({names}) are {top3:.1f}% of NAV, above the {policy['top3_cap_pct']:.0f}% cap")
     shocks = {}
     for shock in (-0.05, -0.10, -0.20):
         pnl = 0.0
@@ -1348,15 +1471,15 @@ def validate_trades(decision: dict, stats: dict) -> dict:
     breach_at = float(policy["core_etf_breach_pct"])
     breaches = []
     if etf_raw > breach_at + 0.05:
-        msg = (f"core ETF sleeve {etf_raw:.1f}% breaches the {breach_at:.0f}% cap "
-               f"(guide {warn_at:.0f}%; the rest is the swing sleeve)")
+        msg = (f"core ETF analysis sleeve {etf_raw:.1f}% exceeds the configured {breach_at:.0f}% safeguard "
+               f"(guide {warn_at:.0f}%; remaining holdings and cash are grouped in the swing sleeve)")
         warnings.append(msg)
         breaches.append(msg)
         etf_status = "breach"
     elif etf_raw > warn_at + 0.05:
         warnings.append(
-            f"core ETF sleeve {etf_raw:.1f}% is above the {warn_at:.0f}% guide "
-            f"(breach above {breach_at:.0f}%; the rest is the swing sleeve)")
+            f"core ETF analysis sleeve {etf_raw:.1f}% is above the configured {warn_at:.0f}% guide "
+            f"(safeguard above {breach_at:.0f}%; remaining holdings and cash are grouped in the swing sleeve)")
         etf_status = "warn"
     else:
         etf_status = "ok"
@@ -1369,9 +1492,9 @@ def validate_trades(decision: dict, stats: dict) -> dict:
     }
     post_trade_risk = {"beta_spy": round(beta_w, 2), "ai_lookthrough_pct": round(ai, 1),
                        "top3_pct": round(top3, 1), "core_etf_pct": round(etf_raw, 1),
-                       "swing_pct": round(100 - etf_raw, 1) if total else 0.0,
+        "non_etf_analysis_pct": round(100 - etf_raw, 1) if total else 0.0,
                        "core_etf_status": etf_status, "stress": shocks,
-                       "note": "Beta and stress are share-weighted from each name's stress beta (else 1y beta, else 1.0). Cash beta is 0. Not a covariance recomputation. core_etf is every ETF; swing is single stocks plus cash."}
+        "note": "Beta and stress are share-weighted from each name's stress beta (else 1y beta, else 1.0). Cash beta is 0. Not a covariance recomputation. ETF and non-ETF groupings describe instrument types, not long-term and swing roles."}
     return {"trades": rows, "post_trade": after, "ending_cash": round(cash, 2),
             "ending_cash_pct": round(cash_pct, 1), "warnings": warnings, "breaches": breaches,
             "sleeves": sleeves, "post_trade_risk": post_trade_risk}
@@ -1408,10 +1531,10 @@ def _cell(x, n=220):
 def render_plan_trades(L, plan, check, targets, sleeve=None):
     order = {tk: i for i, tk in enumerate(plan.get("priority_order", []))}
     trades = sorted(check["trades"], key=lambda t: order.get(t["ticker"], 99))
-    L.append("| # | Ticker | Decision | Action | Shares | Est. price | Value | Order | Limit | Timing | Agent rating | vs agent | Rationale |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("| # | Ticker | Proposed role | Decision | Action | Shares | Est. price | Value | Order | Limit | Timing | Agent rating | vs agent | Rationale |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for i, t in enumerate(trades, 1):
-        L.append(f"| {i} | {t['ticker']}{'' if t.get('is_holding', True) else ' (new)'} | {t.get('decision', '')} | "
+        L.append(f"| {i} | {t['ticker']}{'' if t.get('is_holding', True) else ' (new)'} | {t.get('investment_role', 'unassigned')} | {t.get('decision', '')} | "
                  f"{t['action']} | {t['shares']} | ${t['calc_price']:,.2f} | {fmt_money(t['value_usd'])} | "
                  f"{t.get('order_type', '')} | {'' if t.get('limit_price') in (None, 0) else t['limit_price']} | "
                  f"{_cell(t.get('timing'), 160)} | {t.get('agent_rating', '')} | {t.get('follows_agent', '')} | "
@@ -1423,8 +1546,8 @@ def render_plan_trades(L, plan, check, targets, sleeve=None):
     if risk:
         L.append(f"Post-trade beta (code): **{risk.get('beta_spy')}** | AI look-through **{risk.get('ai_lookthrough_pct')}%** "
                  f"({sleeve_label(sleeve)}) | top 3 **{risk.get('top3_pct')}%** | "
-                 f"core ETF sleeve **{risk.get('core_etf_pct')}%** ({risk.get('core_etf_status')}) | "
-                 f"swing sleeve **{risk.get('swing_pct')}%**")
+                 f"ETF instrument grouping **{risk.get('core_etf_pct')}%** | "
+                 f"non-ETF instrument grouping **{risk.get('non_etf_analysis_pct')}%**")
         L.append("Post-trade stress (code, beta-scaled): " + "; ".join(
             f"{k}: {fmt_money(v['pnl_usd'])} ({v['pnl_pct_of_account']}%)" for k, v in (risk.get("stress") or {}).items()))
         if risk.get("note"):
@@ -1435,8 +1558,8 @@ def render_plan_trades(L, plan, check, targets, sleeve=None):
             f"{a['ticker']} ${a['downside']} ({a.get('downside_source')})" for a in stops))
     if check["warnings"]:
         L.append("\nWarnings:\n" + "\n".join(f"- {w}" for w in check["warnings"]))
-    tw = (targets or {}).get("weights_pct", {})
-    L.append("\n| Ticker | Shares after | Value after | Weight after | Target (guidance) |\n|---|---|---|---|---|")
+    tw = approved_target_weights(targets)
+    L.append("\n| Ticker | Shares after | Value after | Weight after | Owner-approved target |\n|---|---|---|---|---|")
     for a in check["post_trade"]:
         sh = "" if a["shares_after"] is None else f"{a['shares_after']:g}"
         tg = "dynamic" if a["ticker"] == "cash" else (f"{tw[a['ticker']]}%" if a["ticker"] in tw else "")
@@ -1462,7 +1585,7 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
         L.append(f"## Verdict - {stage}\n**{plan.get('headline', '')}**  (confidence: {plan.get('confidence', 'n/a')})\n")
         cd = plan.get("cash_decision") or {}
         L.append("## Cash decision")
-        L.append(f"> **Target cash: {cd.get('target_cash_pct')}%** (policy band {pol['min_pct']}-{pol['max_pct']}%, soft default "
+        L.append(f"> **Proposed cash: {cd.get('target_cash_pct')}%** (configured safeguard range {pol['min_pct']}-{pol['max_pct']}%, not an owner-approved target; soft default "
                  f"{pol['soft_default_pct']}%) | regime: **{cd.get('regime')}** | post-trade cash: "
                  f"**{fmt_money(check['ending_cash'])} ({check['ending_cash_pct']}%)** | current {acct['cash_pct']}%")
         if final and draft:
@@ -1575,11 +1698,9 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
     L.append(f"\n**Concentration:** effective positions {c['effective_positions']}, top 3 "
              + ", ".join(f"{t['ticker']} {t['weight_pct']}%" for t in c["top3"])
              + ". Buckets: " + ", ".join(f"{k} {v}%" for k, v in c["by_bucket_pct"].items()))
-    cap = (stats.get("risk_policy") or {}).get("ai_sleeve_cap_pct")
     L.append("\n### AI sub-themes")
-    L.append("Direct weight of tagged holdings. This table is not the sleeve look-through"
-             + (f" (warn cap **{float(cap):.0f}%** in targets.json)" if cap is not None else "")
-             + ". SPY's configured fraction stays in the look-through and is not split across sub-themes. "
+    L.append("Direct weight of tagged holdings. This table is not the sleeve look-through. "
+             "SPY's configured fraction stays in the look-through and is not split across sub-themes. "
              "A holding with no sub-theme is omitted.")
     L.append("| Sub-theme | Weight | Value | Holdings |\n|---|---|---|---|")
     for bucket in stats.get("ai_subthemes") or []:
@@ -1635,6 +1756,13 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
             extra += " STALE" if v.get("stale") else ""
             L.append(f"- {k}: {v['value']} ({v['date']}{extra})")
     L.append("\n## Appendix B - Source agent reports")
+    L.append("Ticker report freshness (seven calendar days or less is current/reused; older is stale):")
+    for tk, source in stats.get("report_sources", {}).items():
+        L.append(f"- {tk}: {source.get('status')} ({source.get('source_date') or 'date unavailable'}, "
+                 f"age {source.get('age_days') if source.get('age_days') is not None else 'unknown'}d)")
+    scout_source = stats.get("scout_source") or {"status": "missing"}
+    L.append(f"Theme scout: {scout_source.get('status')} ({scout_source.get('date') or 'no dated report'}, "
+             f"age {scout_source.get('age_days') if scout_source.get('age_days') is not None else 'unknown'}d)")
     for tk, r in reports.items():
         L.append(f"- {tk}: {r['pm_rating']} (trader {r['trader_action']}), analysis date {r['analysis_date']}, `logs/reports/{r['report_dir']}`")
     if calls:
@@ -1694,12 +1822,20 @@ def main() -> int:
     themes = load_json(Path(args.themes), {"themes": {}, "buckets": {}})
     tickers = [p["ticker"] for p in book["positions"]]
     cp = targets.get("cash_policy") or {}
-    cash_policy = {"min_pct": args.cash_min if args.cash_min is not None else cp.get("min_pct", 5),
-                   "max_pct": args.cash_max if args.cash_max is not None else cp.get("max_pct", 35),
-                   "soft_default_pct": cp.get("soft_default_pct", targets.get("weights_pct", {}).get("cash", 12)),
-                   "note": "Dynamic: the fund manager chooses the cash target each run inside this band."}
+    guidance = approved_portfolio_guidance(targets)
+    cash_policy = {"min_pct": 0 if guidance else (args.cash_min if args.cash_min is not None else cp.get("min_pct", 5)),
+                   "max_pct": 100 if guidance else (args.cash_max if args.cash_max is not None else cp.get("max_pct", 35)),
+                   "soft_default_pct": (guidance or {}).get("cash_reference_pct", cp.get("soft_default_pct", 12)),
+                   "portfolio_guidance": guidance,
+                   "note": (f"The approved {guidance['cash_reference_pct']:g}/{guidance['long_term_pct']:g}/"
+                            f"{guidance['swing_pct']:g} mix is a flexible guideline. Cash below "
+                            f"{guidance['cash_reference_pct']:g}%, including zero, is allowed.")
+                   if guidance else "Configured operating safeguard, not an owner-approved allocation target. The fund manager proposes cash each run inside this range."}
     watchlist = [] if args.no_watchlist else load_watchlist(Path(args.watchlist), tickers)
     wl_tk = [c["ticker"] for c in watchlist]
+    scout_report = load_scout_report(Path(args.watchlist).parent / "theme_scout", args.date)
+    log(f"theme scout: {scout_report['status']}" +
+        (f" ({scout_report.get('date')}, {scout_report.get('age_days')} days old)" if scout_report.get("date") else ""))
 
     found = find_latest_reports(Path(args.reports_dir), tickers, args.since)
     # candidates always use their latest existing report, however old (flagged with its analysis date)
@@ -1720,6 +1856,16 @@ def main() -> int:
         log("FRED macro snapshot ...")
         macro = fred_snapshot(args.date)
     stats = build_stats(book, close, quotes, themes, targets, meta, args.corr_threshold, watchlist, reports, macro, cash_policy, args.date)
+    stats["scout_source"] = {key: scout_report.get(key) for key in
+                             ("status", "date", "age_days", "generated_utc") if scout_report.get(key) is not None}
+    if scout_report["status"] == "missing":
+        stats["data_checks"].append("No dated theme scout report is available for this review")
+    elif scout_report["status"] == "stale":
+        stats["data_checks"].append(f"Theme scout report is stale: {scout_report['date']} ({scout_report['age_days']} days old)")
+    elif scout_report["status"] == "reused":
+        stats["data_checks"].append(f"Reusing theme scout report from {scout_report['date']} ({scout_report['age_days']} days old)")
+    elif scout_report["status"] == "unavailable":
+        stats["data_checks"].append(scout_report.get("error") or "Theme scout report is unavailable")
     acct = stats["account"]
     log(f"account ${acct['total_value']:,.0f} (cash {acct['cash_pct']}%), vol {stats['risk']['portfolio_ann_vol_pct']}%, "
         f"beta {stats['risk']['portfolio_beta_spy_1y']} (1y) / {stats['risk']['portfolio_beta_spy_2y']} (2y)")
@@ -1730,7 +1876,7 @@ def main() -> int:
     out_dir = Path(args.out_dir) / args.date / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     pre = "snapshot_" if args.no_llm else ""
-    context = build_context(book, targets, stats, reports, macro, args.date)
+    context = build_context(book, targets, stats, reports, macro, args.date, scout_report)
     if args.context_file:
         extra_path = Path(args.context_file)
         if not extra_path.is_file():

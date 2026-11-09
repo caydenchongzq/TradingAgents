@@ -6,9 +6,8 @@
   -Screen   ranked quant screen only (no model, no watchlist edit)
   -NoLLM    weekly macro/news/screen pack, no model, no watchlist edit
   -DryRun   same as -NoLLM
-  A run with none of those flags makes one openai/gpt-6.1-sol call. In shadow mode (default until
-  watchlist_curator.shadow_until) it only writes watchlist_proposals.json; after that it may update
-  data\watchlist.json and append data\watchlist_log.jsonl. It stops first if the weekly budget is spent.
+  A run with none of those flags makes one openai/gpt-6.1-sol call and writes a reviewable
+  watchlist proposal; it never updates data\watchlist.json. It stops first if the weekly budget is spent.
 
 .EXAMPLES
   .\addons\theme_scout\run_theme_scout.ps1 -DryRun

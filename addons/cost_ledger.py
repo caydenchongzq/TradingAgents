@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -99,12 +100,18 @@ def costs_dir(data_root: Path | str) -> Path:
     return Path(data_root) / "fund_manager" / "run_costs"
 
 
+def _filename_component(value: object) -> str:
+    """Return a single safe filename component while keeping ordinary tickers intact."""
+    component = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "run")).strip("._-")
+    return component or "run"
+
+
 def write_run_cost(data_root: Path | str, record: dict) -> Path:
     folder = costs_dir(data_root)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%H%M%S_%f")
-    ticker = str(record.get("ticker") or record.get("label") or "run")
-    day = str(record.get("analysis_date") or "nodate").replace(":", "-")
+    ticker = _filename_component(record.get("ticker") or record.get("label") or "run")
+    day = _filename_component(str(record.get("analysis_date") or "nodate").replace(":", "-"))
     path = folder / f"{ticker}_{day}_{stamp}.json"
     body = dict(record)
     body.setdefault("generated_utc", datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -219,6 +226,7 @@ def weekly_spend(data_root: Path | str, day: date | None = None, targets: dict |
         "unpriced_runs": unpriced,
         "estimated_runs": estimated,
         "budget_usd": budget["weekly_usd"],
+        "budget_enabled": budget["enabled"],
         "runs": runs,
     }
 
@@ -226,23 +234,27 @@ def weekly_spend(data_root: Path | str, day: date | None = None, targets: dict |
 def budget_policy(targets: dict | None) -> dict:
     raw = (targets or {}).get("budget") or {}
     # Top-level weekly_budget_usd wins, then budget.weekly_usd, then 25.
+    # budget.enabled=false suspends the weekly gate without deleting the saved
+    # allowance; usage and estimates continue to be recorded.
     weekly = (targets or {}).get("weekly_budget_usd", raw.get("weekly_usd", DEFAULT_WEEKLY_USD))
     native = raw.get("native_run_estimate_usd", DEFAULT_NATIVE_ESTIMATE)
     fund = raw.get("fund_manager_estimate_usd", DEFAULT_FUND_ESTIMATE)
     return {
         "fallback_model": str(raw.get("fallback_model") or DEFAULT_FALLBACK_MODEL),
         "weekly_usd": float(weekly),
+        "enabled": raw.get("enabled", True) is not False,
         "native_run_estimate_usd": float(native),
         "fund_manager_estimate_usd": float(fund),
     }
 
 
-def gate(spent_usd: float, next_usd: float, weekly_usd: float) -> dict:
+def gate(spent_usd: float, next_usd: float, weekly_usd: float, enabled: bool = True) -> dict:
     """Hard stop before a run that would take the week over the budget."""
     projected = float(spent_usd) + float(next_usd)
-    ok = projected <= float(weekly_usd) + 1e-9
+    ok = not enabled or projected <= float(weekly_usd) + 1e-9
     return {
         "ok": ok,
+        "enabled": enabled,
         "spent_usd": round(float(spent_usd), 6),
         "next_usd": round(float(next_usd), 6),
         "projected_usd": round(projected, 6),
@@ -263,7 +275,7 @@ def evaluate(data_root: Path | str, day: date, kind: str, targets: dict | None =
     # A run with neither USD nor tokens counts at the per-run estimate, so a gap in
     # pricing cannot slip a week past the budget.
     unpriced_usd = spend["unpriced_runs"] * policy["native_run_estimate_usd"]
-    result = gate(spend["spent_usd"] + unpriced_usd, next_usd, policy["weekly_usd"])
+    result = gate(spend["spent_usd"] + unpriced_usd, next_usd, policy["weekly_usd"], policy["enabled"])
     result.update({"week_start": spend["week_start"], "week_end": spend["week_end"], "kind": kind,
                    "priced_usd": spend["spent_usd"], "unpriced_runs": spend["unpriced_runs"],
                    "unpriced_estimate_usd": round(unpriced_usd, 6)})
@@ -282,14 +294,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Check the weekly OpenRouter budget. No model call.")
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--date", default=date.today().isoformat())
-    ap.add_argument("--kind", choices=["native", "fund_manager", "check"], default="check")
+    ap.add_argument("--kind", choices=["native", "fund_manager", "manifest", "check"], default="check")
     ap.add_argument("--next", type=float, default=None)
     args = ap.parse_args(argv)
     root = Path(args.data_root)
     day = datetime.strptime(args.date, "%Y-%m-%d").date()
     result = evaluate(root, day, args.kind, _load_targets(root), args.next)
+    limit = f"${result['budget_usd']:.2f}" if result.get("enabled", True) else "disabled"
     print(
-        f"BUDGET spent={result['spent_usd']} limit={result['budget_usd']} "
+        f"BUDGET spent={result['spent_usd']} limit={limit} "
         f"next={result['next_usd']} projected={result['projected_usd']} "
         f"unpriced_runs={result['unpriced_runs']} ok={str(result['ok']).lower()}"
     )

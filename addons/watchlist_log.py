@@ -97,6 +97,14 @@ def last_undoable(events: list[dict]) -> dict | None:
     undone = undone_ids(events)
     for row in reversed(events):
         if row.get("action") in {"add", "drop"} and str(row.get("id")) not in undone:
+            transaction_id = row.get("transaction_id")
+            if transaction_id:
+                group = [event for event in events if event.get("transaction_id") == transaction_id
+                         and event.get("action") in {"add", "drop"}
+                         and str(event.get("id")) not in undone]
+                if group:
+                    return {"transaction_id": transaction_id, "transaction_events": group,
+                            "ticker": row.get("ticker"), "action": "transaction"}
             return row
     return None
 

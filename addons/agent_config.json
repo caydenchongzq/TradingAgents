@@ -1,3 +1,34 @@
 {
-  "seats": {}
+  "seats": {
+    "theme_scout": {
+      "model": "openai/gpt-6.1-terra",
+      "effort": "medium",
+      "max_tokens": 12000
+    },
+    "risk_aggressive": {
+      "effort": "medium"
+    },
+    "risk_conservative": {
+      "model": "openai/gpt-6-luna",
+      "effort": "medium"
+    },
+    "risk_neutral": {
+      "effort": "medium"
+    },
+    "portfolio_manager": {
+      "effort": "high"
+    },
+    "fm_manager": {
+      "model": "anthropic/claude-opus-5.5"
+    },
+    "fm_aggressive": {
+      "model": "openai/gpt-6.1-terra"
+    },
+    "fm_conservative": {
+      "model": "openai/gpt-6.1-terra"
+    },
+    "fm_neutral": {
+      "model": "openai/gpt-6.1-terra"
+    }
+  }
 }

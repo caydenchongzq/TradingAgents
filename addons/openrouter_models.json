@@ -1,5 +1,5 @@
 {
-  "pricing_note": "Rates match the OpenRouter usage on the 2026-11-06 fund-manager run. A seat shows an estimate only when it also has a token estimate from that run.",
+  "pricing_note": "Rates for GPT-6.1 Sol, GPT-6 Luna, and Claude Opus 5.5 match OpenRouter usage on the 2026-11-06 fund-manager run. Newly listed models have no local rate estimate; the UI shows no estimate until pricing is verified.",
   "models": [
     {
       "id": "openai/gpt-6.1-sol",
@@ -21,6 +21,36 @@
       "effort": true,
       "usd_per_mtok_in": 4,
       "usd_per_mtok_out": 20
+    },
+    {
+      "id": "deepseek/deepseek-v4.1-flash-1017",
+      "label": "DeepSeek V4.1 Flash 1017",
+      "effort": true
+    },
+    {
+      "id": "moonshotai/kimi-k3",
+      "label": "Kimi K3",
+      "effort": true
+    },
+    {
+      "id": "moonshotai/kimi-k3.1-pro",
+      "label": "Kimi K3.1 Pro",
+      "effort": true
+    },
+    {
+      "id": "google/gemini-4-argon",
+      "label": "Gemini 4 Argon",
+      "effort": true
+    },
+    {
+      "id": "openai/gpt-6.1-terra",
+      "label": "GPT-6.1 Terra",
+      "effort": true
+    },
+    {
+      "id": "openai/gpt-6-astra",
+      "label": "GPT-6 Astra",
+      "effort": true
     }
   ]
 }

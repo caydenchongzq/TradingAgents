@@ -3,12 +3,12 @@
 A separate add-on. It does not modify TradingAgents source.
 
 ## Weekly scout
-One `openai/gpt-6.1-sol` call. Inputs are FRED (fed funds, 10y, 2y, curve, CPI, unemployment, VIX), a week of Yahoo and Alpha Vantage headlines, earnings dates, and 1-week / 1-month / 3-month relative strength of sector ETFs and AI sub-themes versus SPY. The model marks each sub-theme overweight, neutral, or avoid and proposes watchlist adds and drops. The list is kept between 30 and 50 names. Watchlist rules: 30–50 names, at most 5 adds and 5 drops a week, a 28-day cooldown after a name is added or dropped, holdings and staged orders are never dropped (flagged trim), new names count as AI weight 1.0 until tagged, and adds are blocked while the book is at the AI cap. Shadow mode is on until `watchlist_curator.shadow_until` in `data\targets.json` (2026-12-05): the scout writes `watchlist_proposals.json` in the run folder and does not edit the watchlist. After that, changes are written and appended to `data\watchlist_log.jsonl` (undo from the Argus Watchlist page). No backup file is written.
+One `openai/gpt-6.1-sol` call. Inputs are FRED (fed funds, 10y, 2y, curve, CPI, unemployment, VIX), a week of Yahoo and Alpha Vantage headlines, earnings dates, and 1-week / 1-month / 3-month relative strength of sector ETFs and AI sub-themes versus SPY. The model marks each sub-theme overweight, neutral, or avoid and proposes watchlist adds and drops. The list is kept between 30 and 50 names. Watchlist rules: 30–50 names, at most 5 adds and 5 drops a week, a 28-day cooldown after a name is added or dropped, holdings and staged orders are never dropped (flagged trim), new names count as AI weight 1.0 until tagged, and adds are blocked while the book is at the AI cap. The scout always writes reviewable proposals and never modifies the live watchlist. Argus proposal review and apply integration is pending; the proposal is not applied until that review flow is available and confirmed.
 
 ```powershell
 cd "D:\Software Development\trading\TradingAgents"
 powershell -ExecutionPolicy Bypass -File .\addons\theme_scout\run_theme_scout.ps1 -DryRun   # no model, no watchlist edit
-powershell -ExecutionPolicy Bypass -File .\addons\theme_scout\run_theme_scout.ps1            # one Sol call, then the watchlist update
+powershell -ExecutionPolicy Bypass -File .\addons\theme_scout\run_theme_scout.ps1            # one Sol call, then a reviewable proposal
 ```
 
 Output: `data\theme_scout\<date>\report.md` and `report.json`.
