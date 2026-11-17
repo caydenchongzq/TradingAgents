@@ -14,6 +14,8 @@ Runs inside the tradingagents Docker image (reuses yfinance/pandas/openai and .e
 from __future__ import annotations
 
 import argparse
+import html
+import hashlib
 import json
 import math
 import os
@@ -28,6 +30,11 @@ import numpy as np
 import pandas as pd
 
 ADDON_DIR = Path(__file__).resolve().parent
+ADDONS_ROOT = ADDON_DIR.parent
+if str(ADDONS_ROOT) not in sys.path:
+    sys.path.insert(0, str(ADDONS_ROOT))
+from portfolio_book import PortfolioBookError, normalize_book
+from trade_validation import TradePolicyError, parse_trade_policy, validate_trades as validate_account_trades
 DATA_ROOT = Path(os.getenv("FM_DATA_ROOT", "/home/appuser/.tradingagents"))
 DEFAULT_MODEL = os.getenv("FUND_MANAGER_MODEL", "openai/gpt-6.1-sol")
 # Quick model already used for per-stock runs (cli prefs: openai/gpt-6-luna).
@@ -50,14 +57,6 @@ DEFAULT_AI_SLEEVE = {
         "QQQ": 0.50, "SMH": 1.0, "IWM": 0.0, "XLE": 0.0, "XLF": 0.0, "GLD": 0.0,
     },
 }
-SUBTHEMES = (
-    ("ai_energy", "AI energy"),
-    ("ai_memory_storage", "AI memory & storage"),
-    ("ai_compute_semis", "AI compute & semis"),
-    ("ai_network_fibre", "AI network & fibre"),
-    ("ai_cloud_software", "AI cloud & software"),
-    ("physical_ai", "Physical AI"),
-)
 RISK_POLICY = {
     "ai_sleeve": DEFAULT_AI_SLEEVE,
     "earnings_warn_days": 7,
@@ -346,6 +345,16 @@ def fetch_prices_with_regime(tickers: list[str], as_of: str | None = None) -> pd
         return fetch_prices(list(tickers), as_of=as_of)
 
 
+def _positive_price(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        px = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return px if math.isfinite(px) and px > 0 else None
+
+
 def live_quotes(tickers: list[str], close: pd.DataFrame, as_of: str | None = None) -> dict:
     """Best-effort latest price; falls back to last daily close.
 
@@ -360,16 +369,19 @@ def live_quotes(tickers: list[str], close: pd.DataFrame, as_of: str | None = Non
             try:
                 import yfinance as yf
                 fi = yf.Ticker(tk).fast_info
-                px = float(fi["last_price"]) if fi["last_price"] else None
-                src = "yfinance fast_info last_price"
-                timing = "live"
+                px = _positive_price(fi.get("last_price"))
+                if px is not None:
+                    src = "yfinance fast_info last_price"
+                    timing = "live"
             except Exception:  # noqa: BLE001
                 px = None
-        if (px is None or not math.isfinite(px)) and tk in close:
+        if px is None and tk in close:
             s = close[tk].dropna()
             if len(s):
-                px, src = float(s.iloc[-1]), f"last close {s.index[-1].date()}"
-                timing = "as_of"
+                close_px = _positive_price(s.iloc[-1])
+                if close_px is not None:
+                    px, src = close_px, f"last close {s.index[-1].date()}"
+                    timing = "as_of"
         out[tk] = {"price": px, "source": src, "as_of": as_of, "timing": timing or "as_of"}
     return out
 
@@ -397,46 +409,6 @@ def fred_snapshot(as_of: str) -> dict:
 
 
 # --------------------------------------------------------------------------- analytics
-def subtheme_of(ticker: str, themes: dict | None, explicit: str | None = None) -> str | None:
-    if explicit:
-        return str(explicit)
-    for name, members in ((themes or {}).get("subthemes") or {}).items():
-        if ticker in members or str(ticker).upper() in {str(m).upper() for m in members}:
-            return str(name)
-    return None
-
-
-def subtheme_table(rows: list[dict], themes: dict | None = None) -> list[dict]:
-    """Direct holding weight by AI sub-theme. Untagged names are left out."""
-    defined = list(((themes or {}).get("subthemes") or {}).keys()) or [k for k, _ in SUBTHEMES]
-    labels = {k: v for k, v in SUBTHEMES}
-    labels.update((themes or {}).get("subtheme_labels") or {})
-    buckets = {
-        name: {"id": name, "label": labels.get(name, name), "weight_pct": 0.0, "market_value": 0.0, "tickers": []}
-        for name in defined
-    }
-    for row in rows:
-        name = row.get("sub_theme")
-        if not name:
-            continue
-        bucket = buckets.setdefault(name, {
-            "id": name, "label": labels.get(name, name), "weight_pct": 0.0, "market_value": 0.0, "tickers": []})
-        weight = float(row.get("weight_pct") or 0)
-        value = float(row.get("market_value") or 0)
-        bucket["weight_pct"] += weight
-        bucket["market_value"] += value
-        bucket["tickers"].append({
-            "ticker": row.get("ticker"), "weight_pct": round(weight, 1), "market_value": round(value, 2)})
-    order = defined + [name for name in buckets if name not in defined]
-    out = []
-    for name in order:
-        bucket = buckets[name]
-        bucket["weight_pct"] = round(bucket["weight_pct"], 1)
-        bucket["market_value"] = round(bucket["market_value"], 2)
-        out.append(bucket)
-    return out
-
-
 def theme_of(tk: str, themes: dict) -> str:
     for th, members in themes.get("themes", {}).items():
         if tk in members:
@@ -495,7 +467,7 @@ def load_watchlist(path: Path, held: list[str]) -> list[dict]:
             continue
         seen.add(tk)
         out.append({"ticker": tk, "sector": item.get("sector"), "type": item.get("type"),
-                    "theme": item.get("theme"), "sub_theme": item.get("sub_theme"), "note": item.get("note")})
+                    "theme": item.get("theme"), "note": item.get("note")})
     return out
 
 
@@ -553,29 +525,87 @@ def _atr_stop(p: pd.Series) -> float | None:
 
 def _earnings_info(tk: str, today: date) -> dict:
     import yfinance as yf
+    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     try:
         frame = yf.Ticker(tk).get_earnings_dates(limit=12)
         index = getattr(frame, "index", None)
         if frame is None or index is None or len(index) == 0:
             return {}
-        dates = []
-        for idx in list(index):
-            raw = idx.date() if hasattr(idx, "date") else None
-            if isinstance(raw, datetime):
-                raw = raw.date()
-            if isinstance(raw, date):
-                dates.append(raw)
-        if not dates:
+        events = []
+        for position, idx in enumerate(index):
+            event_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+            if isinstance(event_dt, date) and not isinstance(event_dt, datetime):
+                event_date = event_dt
+                event_dt = None
+            elif isinstance(event_dt, datetime):
+                event_date = event_dt.date()
+            else:
+                continue
+            row = frame.iloc[position] if hasattr(frame, "iloc") else {}
+            def number(*names):
+                for name in names:
+                    try:
+                        value = float(row[name])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if math.isfinite(value):
+                        return value
+                return None
+            events.append({"date": event_date, "datetime": event_dt,
+                           "reported_eps": number("Reported EPS", "Reported EPS (USD)"),
+                           "estimated_eps": number("EPS Estimate", "EPS Estimate (USD)"),
+                           "surprise_percent": number("Surprise(%)", "Surprise (%)")})
+        if not events:
             return {}
-        future = sorted(d for d in dates if d >= today)
+        now_utc = datetime.now(timezone.utc)
+        def event_key(event):
+            event_dt = event.get("datetime")
+            if isinstance(event_dt, datetime) and event_dt.tzinfo is not None and event_dt.utcoffset() is not None:
+                return event_dt.astimezone(timezone.utc).timestamp()
+            return datetime.combine(event["date"], datetime.min.time(), tzinfo=timezone.utc).timestamp()
+        def is_future(event):
+            event_dt = event.get("datetime")
+            if isinstance(event_dt, datetime) and event_dt.tzinfo is not None and event_dt.utcoffset() is not None:
+                # Live provider timestamps are classified by their actual instant,
+                # independent of a report's historical analysis-date anchor.
+                return event_dt.astimezone(timezone.utc) > now_utc
+            # Date-only or naive values have no exact instant. Group them against
+            # the current calendar, never a possibly historical report anchor.
+            # Today's entry remains on the upcoming side because its time is unknown.
+            return event["date"] >= now_utc.date()
+        future = sorted((e for e in events if is_future(e)), key=event_key)
+        past = [e for e in events if not is_future(e)]
+        latest_past = max(past, key=event_key) if past else None
+        next_event = future[0] if future else None
+        def event_timestamp(event):
+            value = event.get("datetime")
+            if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+                return None
+            return value.isoformat()
+        def event_details(event):
+            if event is None:
+                return None
+            return {"date": event["date"].isoformat(), "datetime": event_timestamp(event),
+                    "reported_eps": event["reported_eps"], "estimated_eps": event["estimated_eps"],
+                    "surprise_percent": event["surprise_percent"]}
+        result = {"timing": "live", "as_of": today.isoformat(), "fetched_at": fetched_at,
+                  "last": latest_past["date"].isoformat() if latest_past else None,
+                  "last_datetime": event_timestamp(latest_past) if latest_past else None,
+                  "date": next_event["date"].isoformat() if next_event else None,
+                  "next_datetime": event_timestamp(next_event) if next_event else None,
+                  "last_event": event_details(latest_past), "next_event": event_details(next_event),
+                  "calendar_days": (next_event["date"] - now_utc.date()).days if next_event else None,
+                  "reported_eps": latest_past["reported_eps"] if latest_past else None,
+                  "estimated_eps": next_event["estimated_eps"] if next_event else None,
+                  "surprise_percent": latest_past["surprise_percent"] if latest_past else None,
+                  "live_fields": ["last", "date", "calendar_days", "reported_eps", "estimated_eps", "surprise_percent"]}
         if not future:
-            return {"last": max(dates).isoformat(), "timing": "live", "as_of": today.isoformat(),
-                    "live_fields": ["last"]}
-        nxt = future[0]
-        return {"date": nxt.isoformat(), "calendar_days": (nxt - today).days,
-                "timing": "live", "as_of": today.isoformat(), "live_fields": ["date", "calendar_days"]}
+            result["date"] = None
+            result["next_datetime"] = None
+            result["calendar_days"] = None
+        return result
     except Exception as e:  # noqa: BLE001
-        return {"error": str(e)[:160], "timing": "live", "as_of": today.isoformat()}
+        return {"error": str(e)[:160], "timing": "live", "as_of": today.isoformat(), "fetched_at": fetched_at}
 
 
 def speaking_order(rnd: int, anchor: str) -> tuple[str, ...]:
@@ -636,20 +666,37 @@ def _sleeve_book(rows: list[dict], cash: float, total: float) -> dict:
         "swing": {"weight_pct": 0.0, "market_value": 0.0, "cost_basis": 0.0, "unrealized_pnl": 0.0},
         "unclassified": {"weight_pct": 0.0, "market_value": 0.0, "cost_basis": 0.0, "unrealized_pnl": 0.0},
     }
+    values_known = all(r.get("market_value") is not None for r in rows)
+    costs_known = all(r.get("cost_basis") is not None for r in rows)
     for r in rows:
         bucket = out[r.get("sleeve") if r.get("sleeve") in out else "unclassified"]
         bucket["weight_pct"] += r.get("weight_pct") or 0
-        bucket["market_value"] += r.get("market_value") or 0
-        bucket["cost_basis"] += r.get("cost_basis") or 0
-        bucket["unrealized_pnl"] += r.get("unrealized_pnl") or 0
-    out["swing"]["market_value"] += cash
-    out["swing"]["cost_basis"] += cash
-    if total:
+        if r.get("market_value") is not None:
+            bucket["market_value"] += r["market_value"]
+        if r.get("cost_basis") is not None:
+            bucket["cost_basis"] += r["cost_basis"]
+        if r.get("unrealized_pnl") is not None:
+            bucket["unrealized_pnl"] += r["unrealized_pnl"]
+    if cash is not None:
+        out["swing"]["market_value"] += cash
+        out["swing"]["cost_basis"] += cash
+    if total is not None and total:
         out["swing"]["weight_pct"] += cash / total * 100
     for bucket in out.values():
         bucket["weight_pct"] = round(bucket["weight_pct"], 1)
         for key in ("market_value", "cost_basis", "unrealized_pnl"):
             bucket[key] = round(bucket[key], 2)
+    if not values_known:
+        for bucket in out.values():
+            bucket["weight_pct"] = None
+            bucket["market_value"] = None
+    elif cash is None:
+        for bucket in out.values():
+            bucket["weight_pct"] = None
+    if not costs_known:
+        for bucket in out.values():
+            bucket["cost_basis"] = None
+            bucket["unrealized_pnl"] = None
     return out
 
 
@@ -776,32 +823,42 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                 meta: dict, corr_threshold: float, watchlist: list[dict], reports: dict,
                 macro: dict | None, cash_policy: dict, as_of: str | None = None) -> dict:
     positions = book["positions"]
-    cash = float(book.get("cash", 0))
+    cash_raw = book.get("cash", 0 if "accounts" not in book else None)
+    cash = float(cash_raw) if isinstance(cash_raw, (int, float)) and not isinstance(cash_raw, bool) and math.isfinite(cash_raw) else None
+    data_checks = []
     tickers = [p["ticker"] for p in positions]
     anchor = datetime.strptime(as_of, "%Y-%m-%d").date() if as_of else date.today()
 
     rows = []
     for p in positions:
-        tk, qty, avg = p["ticker"], float(p["quantity"]), float(p["average_price"])
+        tk, qty = p["ticker"], float(p["quantity"])
+        avg_raw = p.get("average_price")
+        avg = float(avg_raw) if isinstance(avg_raw, (int, float)) and not isinstance(avg_raw, bool) and math.isfinite(avg_raw) else None
         report_age = source_freshness(reports.get(tk), anchor.isoformat())
-        px = quotes.get(tk, {}).get("price")
-        mv = qty * px if px else None
+        px = _positive_price(quotes.get(tk, {}).get("price"))
+        mv = qty * px if isinstance(px, (int, float)) and not isinstance(px, bool) and math.isfinite(px) and px > 0 else None
         th = theme_of(tk, themes)
         rows.append({"ticker": tk, "quantity": qty, "avg_cost": avg, "price": px,
                      "price_source": quotes.get(tk, {}).get("source"),
-                     "market_value": mv, "cost_basis": qty * avg,
-                     "unrealized_pnl": (mv - qty * avg) if mv is not None else None,
+                     "market_value": mv, "cost_basis": qty * avg if avg is not None else None,
+                     "unrealized_pnl": (mv - qty * avg) if mv is not None and avg is not None else None,
                      "unrealized_pnl_pct": ((px / avg - 1) * 100) if px and avg else None,
-                     "theme": th, "sub_theme": subtheme_of(tk, themes),
+                     "theme": th,
                      "bucket": bucket_of(th, themes),
                      "agent_report_status": report_age["status"],
                      "agent_report_date": report_age["source_date"],
                      "agent_report_age_days": report_age["age_days"],
                      **(meta.get(tk) or {})})
-    invested = sum(r["market_value"] or 0 for r in rows)
-    total = invested + cash
+    priced_holdings = all(r["market_value"] is not None for r in rows)
+    invested = sum(r["market_value"] for r in rows) if priced_holdings else None
+    total = invested + cash if invested is not None and cash is not None else None
+    whole_book_available = total is not None
+    if cash is None:
+        data_checks.append("USD cash is unknown for at least one account; cash-inclusive equity and whole-book risk/exposure are unavailable")
+    if not priced_holdings:
+        data_checks.append("At least one nonzero holding has no current quote; cash-inclusive equity and whole-book risk/exposure are unavailable")
     for r in rows:
-        r["weight_pct"] = (r["market_value"] or 0) / total * 100 if total else None
+        r["weight_pct"] = r["market_value"] / total * 100 if whole_book_available and total else None
         r["sleeve"] = trading_sleeve(r["ticker"], r)
 
     rets_all = close.pct_change(fill_method=None).iloc[1:]
@@ -810,7 +867,6 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     bench1 = win1[BENCH] if BENCH in win1 else None
     bench2 = win2[BENCH] if BENCH in win2 else None
 
-    data_checks = []
     report_sources = {}
     expected_reports = [str(ticker) for ticker in tickers] + [row["ticker"] for row in watchlist]
     for ticker in dict.fromkeys(expected_reports):
@@ -864,29 +920,37 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                 elif earn.get("error"):
                     data_checks.append(f"{r['ticker']}: earnings calendar unavailable ({earn['error']})")
 
-    # portfolio-level (1y window, current weights, cash earns 0)
-    w = pd.Series({r["ticker"]: (r["market_value"] or 0) / total for r in rows})
-    w = w[[t for t in w.index if t in win1.columns]]
-    sub = win1[w.index].fillna(0.0)
-    port_ret = pd.Series(sub.values @ w.values, index=sub.index)
-    cov = sub.cov() * TRADING_DAYS
-    port_vol = float(math.sqrt(max(w.values @ cov.values @ w.values, 0)))
-    contrib = (w * (cov.values @ w.values)) / (port_vol ** 2) if port_vol else w * 0
-    port_beta1 = _beta(port_ret, bench1) if bench1 is not None else None
-    sub2 = win2[w.index].fillna(0.0)
-    port_ret2 = pd.Series(sub2.values @ w.values, index=sub2.index)
-    port_beta2 = _beta(port_ret2, bench2) if bench2 is not None else None
-    nav = (1 + port_ret).cumprod()
-    port_mdd = float((nav / nav.cummax() - 1).min())
-    var95_1d = float(-np.percentile(port_ret, 5)) * total
-
-    stress = {}
-    for shock in (-0.05, -0.10, -0.20):
-        loss = sum((r["market_value"] or 0) * (r.get("stress_beta") if r.get("stress_beta") is not None else 1.0) * shock
-                   for r in rows)
-        stress[f"SPY_{int(shock * 100)}pct_beta_scaled"] = {"pnl_usd": round(loss, 0),
-                                                            "pnl_pct_of_account": round(loss / total * 100, 1)}
-    if bench1 is not None:
+    # Cash-inclusive risk requires known cash and a current quote for every
+    # nonzero holding. Never scale a partial holdings sum as though it were NAV.
+    if whole_book_available and total and total > 0:
+        w = pd.Series({r["ticker"]: r["market_value"] / total for r in rows})
+        w = w[[t for t in w.index if t in win1.columns]]
+        sub = win1[w.index].fillna(0.0)
+        port_ret = pd.Series(sub.values @ w.values, index=sub.index)
+        cov = sub.cov() * TRADING_DAYS
+        port_vol = float(math.sqrt(max(w.values @ cov.values @ w.values, 0)))
+        contrib = (w * (cov.values @ w.values)) / (port_vol ** 2) if port_vol else w * 0
+        port_beta1 = _beta(port_ret, bench1) if bench1 is not None else None
+        sub2 = win2[w.index].fillna(0.0)
+        port_ret2 = pd.Series(sub2.values @ w.values, index=sub2.index)
+        port_beta2 = _beta(port_ret2, bench2) if bench2 is not None else None
+        nav = (1 + port_ret).cumprod()
+        port_mdd = float((nav / nav.cummax() - 1).min())
+        var95_1d = float(-np.percentile(port_ret, 5)) * total
+        stress = {}
+        for shock in (-0.05, -0.10, -0.20):
+            loss = sum(r["market_value"] * (r.get("stress_beta") if r.get("stress_beta") is not None else 1.0) * shock
+                       for r in rows)
+            stress[f"SPY_{int(shock * 100)}pct_beta_scaled"] = {"pnl_usd": round(loss, 0),
+                                                                "pnl_pct_of_account": round(loss / total * 100, 1)}
+    else:
+        w = pd.Series(dtype=float)
+        sub = win1.iloc[:, 0:0]
+        port_ret = pd.Series(index=win1.index, dtype=float)
+        port_vol = port_beta1 = port_beta2 = port_mdd = var95_1d = None
+        contrib = pd.Series(dtype=float)
+        stress = {}
+    if whole_book_available and total and total > 0 and bench1 is not None:
         spy5 = (1 + bench1).rolling(5).apply(np.prod, raw=True) - 1
         loc = win1.index.get_loc(spy5.idxmin())
         span = win1.iloc[max(loc - 4, 0): loc + 1]
@@ -897,14 +961,17 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
             "spy_move_pct": round(float(spy5.min()) * 100, 1),
             "pnl_usd": round(replay, 0), "pnl_pct_of_account": round(replay / total * 100, 1)}
 
-    wts = np.array([r["weight_pct"] or 0 for r in rows]) / 100
+    wts = np.array([(r["market_value"] / invested if invested else 0) for r in rows])
     inv_w = wts / wts.sum() if wts.sum() else wts
-    hhi = float((inv_w ** 2).sum())
+    hhi = float((inv_w ** 2).sum()) if priced_holdings else None
     by_theme, by_bucket = {}, {}
     for r in rows:
-        by_theme[r["theme"]] = by_theme.get(r["theme"], 0) + (r["weight_pct"] or 0)
-        by_bucket[r["bucket"]] = by_bucket.get(r["bucket"], 0) + (r["weight_pct"] or 0)
-    top3 = sorted(rows, key=lambda r: -(r["weight_pct"] or 0))[:3]
+        if r["market_value"] is not None and invested:
+            invested_weight = r["market_value"] / invested * 100
+            by_theme[r["theme"]] = by_theme.get(r["theme"], 0) + invested_weight
+            by_bucket[r["bucket"]] = by_bucket.get(r["bucket"], 0) + invested_weight
+    top3 = sorted((r for r in rows if r["market_value"] is not None),
+                  key=lambda r: -(r["market_value"] / invested if invested else 0))[:3]
     corr = win1[[t for t in tickers if t in win1]].corr().round(2)
 
     drift = None
@@ -915,12 +982,15 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
             t = tw.get(r["ticker"])
             if t is None or not r["price"]:
                 continue
+            if not whole_book_available or r["weight_pct"] is None:
+                continue
             drift.append({"ticker": r["ticker"], "current_pct": round(r["weight_pct"], 1), "target_pct": t,
                           "drift_pct": round(r["weight_pct"] - t, 1),
                           "shares_to_target": int(round((t / 100 * total - (r["market_value"] or 0)) / r["price"]))})
         guidance = cash_policy.get("portfolio_guidance") or {}
         cash_reference = guidance.get("cash_reference_pct", cash_policy["soft_default_pct"])
-        drift.append({"ticker": "cash", "current_pct": round(cash / total * 100, 1),
+        if whole_book_available and total:
+            drift.append({"ticker": "cash", "current_pct": round(cash / total * 100, 1),
                       "target_pct": f"dynamic guideline ({cash_reference}% reference; 0-100% allowed)",
                       "drift_pct": round(cash / total * 100 - cash_reference, 1)})
 
@@ -979,12 +1049,11 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     for c in watchlist:
         tk = c["ticker"]
         report_age = source_freshness(reports.get(tk), anchor.isoformat())
-        ent = {**c, "sleeve": trading_sleeve(tk, c), "price": quotes.get(tk, {}).get("price"),
+        ent = {**c, "sleeve": trading_sleeve(tk, c), "price": _positive_price(quotes.get(tk, {}).get("price")),
                "has_agent_report": tk in reports,
                "agent_report_status": report_age["status"],
                "agent_report_date": report_age["source_date"],
                "agent_report_age_days": report_age["age_days"],
-               "sub_theme": c.get("sub_theme") or subtheme_of(tk, themes),
                "agent_rating": reports.get(tk, {}).get("pm_rating") if tk in reports else None,
                **({k: v for k, v in (meta.get(tk) or {}).items() if k == "name"})}
         if tk not in win1 or win1[tk].dropna().empty:
@@ -999,8 +1068,13 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
             b2 = _beta(s2, bench2) if len(s2) >= len(s.dropna()) + 40 else None
             ent["beta_1y"] = round(b1, 2) if b1 is not None else None
             ent["beta_2y"] = round(b2, 2) if b2 is not None else None
-        ent["corr_to_book_1y"] = round(float(s.corr(port_ret)), 2)
-        ent["avg_corr_to_holdings_1y"] = round(float(win1[list(w.index)].corrwith(s).mean()), 2)
+        ent["corr_to_book_1y"] = round(float(s.corr(port_ret)), 2) if whole_book_available else None
+        holding_tickers = [r["ticker"] for r in rows
+                           if r.get("market_value") is not None and r["ticker"] in win1.columns]
+        holding_corr = win1[holding_tickers].corrwith(s).dropna() if holding_tickers else pd.Series(dtype=float)
+        ent["avg_corr_to_holdings_1y"] = (
+            round(float(holding_corr.mean()), 2)
+            if not holding_corr.empty and math.isfinite(float(holding_corr.mean())) else None)
         ent.update(_trend_stats(close[tk]))
         if tk in close:
             ent["atr_stop"] = _atr_stop(close[tk])
@@ -1012,7 +1086,7 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
                     data_checks.append(f"{tk}: earnings {earn.get('date')} in {earn['calendar_days']} calendar days")
         # diversification benefit: add 3% funded from cash, and swap 3% out of top risk contributor
         x = s.fillna(0.0)
-        for label, w_new in (("add3pct_from_cash", w.copy()), (f"swap3pct_from_{top_risk}", w.copy())):
+        for label, w_new in (("add3pct_from_cash", w.copy()), (f"swap3pct_from_{top_risk}", w.copy())) if whole_book_available else ():
             if label.startswith("swap") and top_risk:
                 w_new[top_risk] = max(w_new[top_risk] - 0.03, 0)
             mat = pd.concat([sub, x.rename(tk)], axis=1).fillna(0.0)
@@ -1023,22 +1097,32 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
 
     return {
         "as_of_prices": str(close.index[-1].date()),
-        "account": {"total_value": round(total, 2), "invested": round(invested, 2), "cash": cash,
-                    "cash_pct": round(cash / total * 100, 1) if total else None,
-                    "unrealized_pnl": round(sum(r["unrealized_pnl"] or 0 for r in rows), 2)},
+        "account": {"total_value": round(total, 2) if total is not None else None,
+                    "invested": round(invested, 2) if invested is not None else None, "cash": cash,
+                    "cash_pct": round(cash / total * 100, 1) if whole_book_available and total else None,
+                    "unrealized_pnl": (round(sum(r["unrealized_pnl"] for r in rows), 2)
+                                       if all(r["unrealized_pnl"] is not None for r in rows) else None),
+                    "whole_book_available": whole_book_available},
+        "accounts": [{**{k: v for k, v in account.items() if k != "positions"},
+                      "positions": [{**position, "price": _positive_price(quotes.get(position.get("ticker"), {}).get("price"))}
+                                    for position in account.get("positions", [])]}
+                     for account in book.get("accounts", [])],
         "sleeves": _sleeve_book(rows, cash, total),
         "cash_policy": cash_policy,
         "positions": rows,
-        "risk": {"portfolio_ann_vol_pct": round(port_vol * 100, 1),
+        "risk": {"portfolio_ann_vol_pct": round(port_vol * 100, 1) if port_vol is not None else None,
                  "portfolio_beta_spy_1y": round(port_beta1, 2) if port_beta1 is not None else None,
                  "portfolio_beta_spy_2y": round(port_beta2, 2) if port_beta2 is not None else None,
                  "spy_ann_vol_pct": per.get(BENCH, {}).get("ann_vol_pct"),
-                 "max_drawdown_1y_current_weights_pct": round(port_mdd * 100, 1),
-                 "var95_1d_usd": round(var95_1d, 0),
+                 "max_drawdown_1y_current_weights_pct": round(port_mdd * 100, 1) if port_mdd is not None else None,
+                 "var95_1d_usd": round(var95_1d, 0) if var95_1d is not None else None,
                  "risk_contribution_pct": {k: round(float(v) * 100, 1) for k, v in contrib.sort_values(ascending=False).items()}},
         "stress": stress,
-        "concentration": {"hhi_invested": round(hhi, 3), "effective_positions": round(1 / hhi, 1) if hhi else None,
-                          "top3": [{"ticker": r["ticker"], "weight_pct": round(r["weight_pct"], 1)} for r in top3],
+        "concentration": {"basis": "invested holdings" if whole_book_available else ("priced holdings only" if priced_holdings else "unavailable"),
+                          "hhi_invested": round(hhi, 3) if hhi is not None else None,
+                          "effective_positions": round(1 / hhi, 1) if hhi else None,
+                          "top3": [{"ticker": r["ticker"], "weight_pct": round(r["market_value"] / invested * 100, 1)
+                                    if invested else None} for r in top3],
                           "by_theme_pct": {k: round(v, 1) for k, v in by_theme.items()},
                           "by_bucket_pct": {k: round(v, 1) for k, v in by_bucket.items()}},
         "regime": regime,
@@ -1048,7 +1132,6 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
         "correlation_clusters": correlation_clusters(corr.drop(index=BENCH, columns=BENCH, errors="ignore"), corr_threshold),
         "correlation_threshold": corr_threshold,
         "target_drift": drift,
-        "ai_subthemes": subtheme_table(rows, themes),
         "watchlist": cands,
         "watchlist_swap_source": top_risk,
         "data_checks": data_checks,
@@ -1065,8 +1148,9 @@ whole-portfolio decision they could not.
 Rules:
 1. Diagnose the portfolio from the quantitative stats (weights, P&L, vol, 1y/2y beta, risk contribution,
    correlation clusters, VaR, stress, concentration, drift) plus the market regime and macro snapshot.
-2. For EVERY holding decide keep / trim / exit / add, with exact WHOLE-SHARE trades. Never sell more than
-   held. No shorting, options or margin; ending cash >= 0. Use the provided prices.
+2. For EVERY account holding decide keep / trim / exit / add. Identify the account for every trade.
+   Buys and trims use whole shares; a complete exit may include a fractional available remainder. Never
+   sell more than held. No shorting, options or margin; use only the provided quote and account cash.
 3. Weigh each single-stock PM view against portfolio context. You may size differently or override; say so.
 4. Only `approved_targets_pct` contains owner-approved allocation targets; absent entries are not mandates.
    Cash is NOT fixed: choose a proposed target cash % each run. The approved cash reference is a guideline,
@@ -1090,8 +1174,8 @@ Rules:
    `ticker_weight` overrides it; unknown exposure is not automatically 100% AI. These metrics do not rank
    or exclude opportunities by themselves.
    Keep actual execution constraints: do not short, use options or margin, spend more cash than is
-   available, sell more shares than held, or propose an unaffordable whole-share trade. `ai_subthemes`
-   describes direct holding weight by sub-theme, not a spending or allocation limit.
+   available, sell more shares than held, or propose an unaffordable trade. Per-order fees and minimum
+   entry/residual guidance are provided in the trade policy; account cash cannot be pooled.
    Flag earnings inside earnings_warn_days and assess gap/event risk. Explain whether to enter before the
    event, wait until after it, or reduce exposure, with the supporting evidence and proposed size; an
    upcoming earnings date is a risk factor, not an automatic ban on an otherwise supported opportunity.
@@ -1132,7 +1216,7 @@ watchlist candidates. Debate the CASH level explicitly (give your own target cas
 soft owner guidance). Core ETF and swing are analysis groupings by instrument type, not owner-approved roles.
 Review investment roles and reassessment conditions from the proposed role and evidence, regardless of
 instrument type. Do not invent a tight stop without evidence.
-Respond directly to the other analysts' earlier points where present. Propose specific whole-share changes
+   Respond directly to the other analysts' earlier points where present. Propose specific account-scoped changes
 (ticker, action, shares) or say 'no change'. Be concise and numeric (<= ~500 words of content)."""
 
 
@@ -1146,11 +1230,12 @@ ARR_S = {"type": "array", "items": S}
 
 TRADE_ITEM = _obj({
     "ticker": S,
+    "account_id": S,
     "is_holding": {"type": "boolean"},
     "investment_role": {"type": "string", "enum": ["long_term", "swing", "unassigned"]},
     "decision": {"type": "string", "enum": ["keep", "trim", "exit", "add", "new_position", "pass"]},
     "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
-    "shares": {**I, "description": "whole shares; 0 for HOLD"},
+    "shares": {**N, "description": "whole shares for buys/trims; fractional shares only for complete exits; 0 for HOLD"},
     "est_price": N, "order_type": {"type": "string", "enum": ["market", "limit", "stop", "staged", "none"]},
     "limit_price": NN, "timing": S, "agent_rating": S,
     "follows_agent": {"type": "string", "enum": ["agrees", "sizes_differently", "overrides", "no_agent_report"]},
@@ -1206,6 +1291,8 @@ def build_context(book, targets, stats, reports, macro, as_of, scout_report: dic
         "## Book (shares, average cost, cash)", json.dumps(book, indent=1),
         "## Owner-approved allocation targets and soft portfolio guidance (missing fields are not mandates)",
         json.dumps(owner_policy, indent=1) if owner_policy else "none provided",
+        "## Trade policy (per account; deterministic checks apply these limits)",
+        json.dumps(stats.get("trade_policy") or {}, indent=1),
         "## Positions with live prices and per-stock stats", json.dumps(slim_pos, indent=1),
         "## Portfolio-level quantitative stats, regime and configured safeguards", json.dumps(stats_view, indent=1),
         "## Dated theme scout report and freshness (ideas and ranking are evidence, not approved changes)",
@@ -1240,7 +1327,8 @@ def build_context(book, targets, stats, reports, macro, as_of, scout_report: dic
 
 
 def call_llm(model: str, system: str, user: str, schema: dict, name: str, max_tokens: int,
-             effort: str | None, label: str, temperature: float | None = None) -> dict:
+             effort: str | None, label: str, temperature: float | None = None,
+             attempt_path: Path | None = None) -> dict:
     from openai import OpenAI
 
     key = os.getenv("OPENROUTER_API_KEY")
@@ -1253,48 +1341,281 @@ def call_llm(model: str, system: str, user: str, schema: dict, name: str, max_to
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     attempts = [("json_schema", {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}}),
                 ("json_object", {"type": "json_object"}), ("text", None)]
-    last_err = None
-    for mode, rf in attempts:
+    last_err, attempt_rows, last_response = None, [], None
+    for attempt_no, (mode, response_format) in enumerate(attempts, 1):
+        started = time.time()
         try:
-            t0 = time.time()
             kwargs = dict(model=model, messages=msgs, max_tokens=max_tokens, extra_body=extra)
             if temperature is not None:
                 kwargs["temperature"] = float(temperature)
-            if rf:
-                kwargs["response_format"] = rf
+            if response_format:
+                kwargs["response_format"] = response_format
             if mode == "json_object":
                 kwargs["messages"] = [msgs[0], {"role": "user", "content": user + "\n\nReturn ONLY JSON matching this schema:\n" + json.dumps(schema)}]
-            resp = client.chat.completions.create(**kwargs)
-            content = resp.choices[0].message.content or ""
-            usage = resp.usage.model_dump() if resp.usage else {}
-            parsed = None
-            if mode != "text":
-                try:
-                    parsed = json.loads(content)
-                except json.JSONDecodeError:
-                    m = re.search(r"\{.*\}", content, re.S)
-                    parsed = json.loads(m.group(0)) if m else None
-                if parsed is None:
-                    raise ValueError("model did not return valid JSON")
-            out = {"label": label, "mode": mode, "content": content, "parsed": parsed, "usage": usage,
-                   "seconds": round(time.time() - t0, 1), "model": getattr(resp, "model", model)}
-            log(f"  {label}: {model} done in {out['seconds']}s ({mode}), tokens {usage.get('prompt_tokens')}/"
-                f"{usage.get('completion_tokens')}, cost {usage.get('cost', 'n/a')}")
-            try:
-                _addons_root()
-                import cost_ledger
-                cost_ledger.write_chat_cost(DATA_ROOT, label=label, model=out["model"], usage=usage)
-            except Exception as cost_exc:  # noqa: BLE001
-                log(f"  cost file skipped: {str(cost_exc)[:160]}")
-            return out
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            log(f"  {label}: mode '{mode}' failed: {str(e)[:300]}")
-    raise RuntimeError(f"{label}: all LLM attempts failed: {last_err}")
+            response = client.chat.completions.create(**kwargs)
+        except Exception as exc:  # provider did not return a completion
+            last_err = exc
+            error_row = {"event": "request_error", "attempt": attempt_no, "label": label,
+                         "mode": mode, "schema_name": name,
+                         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                         "error": str(exc)[:500]}
+            if attempt_path:
+                _append_attempt(attempt_path, error_row)
+            attempt_rows.append(error_row)
+            log(f"  {label}: mode '{mode}' failed: {str(exc)[:300]}")
+            continue
+
+        content = response.choices[0].message.content or ""
+        usage = response.usage.model_dump() if response.usage else {}
+        actual_model = getattr(response, "model", model)
+        choice = response.choices[0]
+        attempt_id = hashlib.sha256(f"{attempt_path.resolve() if attempt_path else ''}|{label}|{attempt_no}|{mode}".encode()).hexdigest()
+        attempt = {"event": "response", "attempt": attempt_no, "attempt_id": attempt_id, "label": label, "mode": mode,
+                   "schema_name": name, "schema": schema, "model_requested": model,
+                   "model_returned": actual_model, "response_id": getattr(response, "id", None),
+                   "finish_reason": getattr(choice, "finish_reason", None),
+                   "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "analysis_date": attempt_path.parent.parent.name if attempt_path else None,
+                   "usage": usage, "content": content}
+        # If this durable write fails, fail closed before another paid retry.
+        if attempt_path:
+            _append_attempt(attempt_path, attempt)
+        attempt_rows.append(attempt)
+        cost_error = None
+        try:
+            _addons_root()
+            import cost_ledger
+            cost_ledger.write_chat_cost(DATA_ROOT, label=label, model=actual_model, usage=usage,
+                                        analysis_date=attempt_path.parent.parent.name if attempt_path else None,
+                                        attempt_id=attempt_id, generated_utc=attempt["created_utc"])
+        except Exception as exc:  # noqa: BLE001
+            cost_error = str(exc)[:300]
+            log(f"  cost file skipped: {cost_error}")
+        try:
+            parsed = parse_structured_response(content, schema)
+            parse_error = None
+        except Exception as exc:  # preserve raw provider response, then retry format
+            parsed, parse_error, last_err = None, str(exc)[:500], exc
+        result_row = {"event": "parse_result", "attempt": attempt_no, "label": label,
+                      "status": "valid" if parsed is not None else "invalid",
+                      "error": parse_error, "cost_error": cost_error}
+        if attempt_path:
+            _append_attempt(attempt_path, result_row)
+        attempt_rows.append(result_row)
+        last_response = {"label": label, "mode": mode, "content": content, "parsed": parsed,
+                         "usage": usage, "seconds": round(time.time() - started, 1),
+                         "model": actual_model, "attempt_id": attempt_id, "attempts": attempt_rows,
+                         "parse_error": parse_error, "cost_error": cost_error}
+        log(f"  {label}: {model} returned ({mode}), tokens {usage.get('prompt_tokens')}/"
+            f"{usage.get('completion_tokens')}, cost {usage.get('cost', 'n/a')}")
+        if parsed is not None:
+            if cost_error:
+                raise RuntimeError(f"usage was returned but cost accounting failed: {cost_error}")
+            return last_response
+        if cost_error:
+            # Do not make another paid attempt while usage from this completion is unaccounted.
+            return last_response
+    if last_response is not None:
+        return last_response
+    raise RuntimeError(f"{label}: all provider attempts failed before a response: {last_err}")
 
 
-def run_debate(context: str, draft: dict, plan: dict, rounds: int, anchor: str) -> list[dict]:
-    transcript = []
+def _append_attempt(path: Path, row: dict) -> None:
+    """Append and fsync an attempt record before additional work or paid retries."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = (json.dumps(row, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        # Each report run owns one journal and invokes model stages serially.
+        # O_APPEND keeps records at EOF on both POSIX and Windows.
+        written = os.write(fd, raw)
+        if written != len(raw):
+            raise OSError("incomplete response journal write")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _validate_schema(value: Any, schema: dict, path: str = "$") -> None:
+    kind = schema.get("type")
+    validators = {"object": lambda x: isinstance(x, dict), "array": lambda x: isinstance(x, list),
+                  "string": lambda x: isinstance(x, str), "integer": lambda x: isinstance(x, int) and not isinstance(x, bool),
+                  "number": lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+                  and (not isinstance(x, float) or math.isfinite(x)),
+                  "boolean": lambda x: isinstance(x, bool), "null": lambda x: x is None}
+    if isinstance(kind, list):
+        matching = [candidate for candidate in kind if candidate not in validators or validators[candidate](value)]
+        if not matching:
+            raise ValueError(f"{path}: expected one of {kind}")
+        kind = matching[0]
+    if kind in validators and not validators[kind](value):
+        raise ValueError(f"{path}: expected {kind}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"{path}: value is outside enum")
+    if kind == "object":
+        missing = [key for key in schema.get("required", []) if key not in value]
+        if missing:
+            raise ValueError(f"{path}: missing required fields {missing}")
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            unexpected = set(value) - set(props)
+            if unexpected:
+                raise ValueError(f"{path}: unexpected fields {sorted(unexpected)}")
+        for key, item in value.items():
+            if key in props:
+                _validate_schema(item, props[key], f"{path}.{key}")
+    elif kind == "array":
+        for index, item in enumerate(value):
+            _validate_schema(item, schema.get("items", {}), f"{path}[{index}]")
+
+
+def _container_end(text: str, start: int) -> int | None:
+    pairs = {"{": "}", "[": "]"}
+    stack = []
+    quoted = escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == '"':
+            quoted = True
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in ("}", "]"):
+            if not stack or stack.pop() != char:
+                return index + 1
+            if not stack:
+                return index + 1
+    return None
+
+
+def parse_structured_response(content: str, schema: dict) -> dict:
+    """Parse one unambiguous complete JSON object and validate its stage schema."""
+    def reject_constant(token: str):
+        raise ValueError(f"non-standard JSON number {token} is not accepted")
+    decoder = json.JSONDecoder(parse_constant=reject_constant)
+    objects = []
+    cursor = 0
+    while True:
+        starts = [index for index in (content.find("{", cursor), content.find("[", cursor)) if index >= 0]
+        if not starts:
+            break
+        start = min(starts)
+        try:
+            value, end = decoder.raw_decode(content, start)
+        except json.JSONDecodeError as exc:
+            # Never mine an inner object from a truncated/broken outer object or array.
+            container_end = _container_end(content, start)
+            if container_end is None:
+                raise ValueError("truncated JSON container") from exc
+            raise ValueError("malformed JSON container") from exc
+        if isinstance(value, list) and any(isinstance(item, dict) for item in value):
+            raise ValueError("top-level JSON arrays containing objects are not accepted")
+        if isinstance(value, dict):
+            objects.append(value)
+        cursor = end
+    if len(objects) != 1:
+        raise ValueError("expected exactly one JSON object in the response")
+    value = objects[0]
+    _validate_schema(value, schema)
+    return value
+
+
+def validate_candidate(decision: dict, stats: dict, label: str, attempt_path: Path,
+                       attempt_id: str | None = None) -> dict:
+    """Run deterministic trade validation and journal its result before promotion."""
+    try:
+        result = validate_trades(decision, stats)
+    except Exception as exc:
+        _append_attempt(attempt_path, {"event": "trade_validation_result", "label": label, "attempt_id": attempt_id,
+                                       "status": "invalid", "error": str(exc)[:1000]})
+        raise
+    _append_attempt(attempt_path, {"event": "trade_validation_result", "label": label, "attempt_id": attempt_id,
+                                   "status": "valid"})
+    return result
+
+
+def _attempt_summaries(attempt_path: Path) -> list[dict]:
+    if not attempt_path.is_file():
+        return []
+    rows, statuses, trade_statuses = [], {}, {}
+    for line in attempt_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        key = (row.get("label"), row.get("attempt"))
+        if row.get("event") == "parse_result":
+            statuses[key] = row
+        elif row.get("event") == "trade_validation_result":
+            trade_statuses[row.get("attempt_id") or row.get("label")] = row
+        elif row.get("event") in ("response", "request_error"):
+            rows.append(row)
+    result = []
+    for row in rows:
+        key = (row.get("label"), row.get("attempt"))
+        parsed = statuses.get(key, {})
+        result.append({"label": row.get("label"), "attempt": row.get("attempt"),
+                       "mode": row.get("mode"), "schema_name": row.get("schema_name"),
+                       "created_utc": row.get("created_utc"),
+                       "model_requested": row.get("model_requested"),
+                       "returned_model": row.get("model_returned"),
+                       "response_id": row.get("response_id"), "finish_reason": row.get("finish_reason"),
+                       "usage": row.get("usage"), "content": row.get("content"),
+                       "parse_status": parsed.get("status", "request_error" if row.get("event") == "request_error" else "pending"),
+                       "error": parsed.get("error") or row.get("error"),
+                       "cost_error": parsed.get("cost_error"),
+                       "trade_validation_status": trade_statuses.get(row.get("attempt_id") or row.get("label"), {}).get("status"),
+                       "trade_validation_error": trade_statuses.get(row.get("attempt_id") or row.get("label"), {}).get("error")})
+    return result
+
+
+def _unvalidated_outputs(attempt_path: Path) -> list[dict]:
+    if not attempt_path.is_file():
+        return []
+    responses, parse_results, trade_results, debate_results = {}, {}, {}, set()
+    for line in attempt_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        key = (row.get("label"), row.get("attempt"))
+        if row.get("event") == "response":
+            responses[key] = row
+        elif row.get("event") == "parse_result":
+            parse_results[key] = row
+        elif row.get("event") == "trade_validation_result":
+            trade_results[row.get("attempt_id") or row.get("label")] = row
+        elif row.get("event") == "debate_result" and row.get("status") == "accepted":
+            debate_results.add(row.get("label"))
+    records = []
+    for key, response in responses.items():
+        parsed = parse_results.get(key, {})
+        schema_name = response.get("schema_name")
+        trade = trade_results.get(response.get("attempt_id") or response.get("label"), {})
+        include, reason = False, None
+        if parsed.get("status") != "valid":
+            include, reason = True, parsed.get("error") or "Structured response validation failed"
+        elif schema_name in ("fund_manager_draft", "fund_manager_final") and trade.get("status") != "valid":
+            include, reason = True, trade.get("error") or parsed.get("cost_error") or "Decision not deterministically trade-validated"
+        elif schema_name in ("aggressive_risk_view", "conservative_risk_view", "neutral_risk_view") and response.get("label") not in debate_results:
+            include, reason = True, parsed.get("cost_error") or "Risk response was not accepted into the completed debate"
+        if include:
+            records.append({"label": response.get("label"), "mode": response.get("mode"),
+                            "content": response.get("content", ""), "reason": reason,
+                            "usage": response.get("usage"), "model": response.get("model_returned")})
+    return records
+
+
+def run_debate(context: str, draft: dict, plan: dict, rounds: int, anchor: str,
+               attempt_path: Path | None = None, transcript: list[dict] | None = None) -> list[dict]:
+    transcript = transcript if transcript is not None else []
     for rnd in range(1, rounds + 1):
         order = speaking_order(rnd, anchor)
         log(f"  risk round {rnd} speaking order: {' -> '.join(order)}")
@@ -1307,7 +1628,13 @@ def run_debate(context: str, draft: dict, plan: dict, rounds: int, anchor: str) 
                     + "\n\n## Your task\n" + ANALYST_TASK)
             spec = plan[f"fm_{role}"]
             res = call_llm(spec["model"], spec["system"], user, ANALYST_SCHEMA, f"{role}_risk_view",
-                           spec["max_tokens"], spec["effort"], f"risk/{role} r{rnd}", spec.get("temperature"))
+                           spec["max_tokens"], spec["effort"], f"risk/{role} r{rnd}",
+                           spec.get("temperature"), attempt_path)
+            if res["parsed"] is None:
+                raise RuntimeError(f"risk/{role} r{rnd} returned no schema-valid response: {res.get('parse_error')}")
+            _append_attempt(attempt_path, {"event": "debate_result", "label": res["label"],
+                                           "attempt_id": res.get("attempt_id"),
+                                           "round": rnd, "role": role, "status": "accepted"})
             transcript.append({"round": rnd, "role": role, "model": spec["model"], "parsed": res["parsed"],
                                "content": res["content"] if not res["parsed"] else None,
                                "usage": res["usage"], "seconds": res["seconds"], "mode": res["mode"]})
@@ -1333,7 +1660,7 @@ def _stop_number(value) -> float | None:
     return None
 
 
-def validate_trades(decision: dict, stats: dict) -> dict:
+def _legacy_validate_trades(decision: dict, stats: dict) -> dict:
     pos = {r["ticker"]: r for r in stats["positions"]}
     wl = {c["ticker"]: c for c in stats.get("watchlist", [])}
     cash = float(stats["account"]["cash"])
@@ -1354,7 +1681,10 @@ def validate_trades(decision: dict, stats: dict) -> dict:
             if tk not in pos:
                 warnings.append(f"{tk}: not in book or watchlist - priced at model estimate ${px:,.2f}")
         prices[tk] = px
-        sh = int(t.get("shares") or 0)
+        try:
+            sh = float(t.get("shares") or 0)
+        except (TypeError, ValueError):
+            sh = 0.0
         act = (t.get("action") or "HOLD").upper()
         if tk in seen:
             warnings.append(f"{tk}: duplicate trade ignored (first row kept)")
@@ -1366,7 +1696,7 @@ def validate_trades(decision: dict, stats: dict) -> dict:
             held = new_qty.get(tk, 0)
             if sh > held:
                 warnings.append(f"{tk}: model asked to sell {sh} but only {held:g} held - capped")
-                sh = int(held)
+                sh = float(held)
             new_qty[tk] = held - sh
             cash += sh * px
         elif act == "BUY":
@@ -1500,18 +1830,113 @@ def validate_trades(decision: dict, stats: dict) -> dict:
             "sleeves": sleeves, "post_trade_risk": post_trade_risk}
 
 
+def validate_trades(decision: dict, stats: dict) -> dict:
+    """Use the deterministic fee/account validator, then retain legacy risk summaries."""
+    effective = validate_account_trades(decision, stats, policy=stats.get("trade_policy"))
+    holding_info = {p.get("ticker"): p for p in stats.get("positions", [])}
+    candidate_info = {p.get("ticker"): p for p in stats.get("watchlist", [])}
+    for row in effective.get("trades", []):
+        info = holding_info.get(row.get("ticker")) or candidate_info.get(row.get("ticker")) or {}
+        row["is_holding"] = row.get("ticker") in holding_info
+        row["sleeve"] = trading_sleeve(row.get("ticker"), info)
+        row.setdefault("investment_role", "unassigned")
+    by_ticker: dict[str, float] = {}
+    for row in effective.get("trades", []):
+        if row.get("status") not in {"accepted", "adjusted"} or row.get("action") not in {"BUY", "SELL"}:
+            continue
+        tk = row.get("ticker")
+        if not tk:
+            continue
+        q = float(row.get("effective_shares", row.get("shares", 0)) or 0)
+        by_ticker[tk] = by_ticker.get(tk, 0.0) + (q if row["action"] == "BUY" else -q)
+    legacy_trades = []
+    for tk, signed in by_ticker.items():
+        if abs(signed) < 1e-10:
+            continue
+        legacy_trades.append({"ticker": tk, "action": "BUY" if signed > 0 else "SELL",
+                              "shares": abs(signed), "decision": "add" if signed > 0 else "trim"})
+    current_cash = (stats.get("account") or {}).get("cash")
+    current_total = (stats.get("account") or {}).get("total_value")
+    fees = effective.get("fees_usd", 0.0)
+    if isinstance(current_cash, (int, float)) and not isinstance(current_cash, bool) and current_total is not None:
+        risk_stats = {**stats, "account": {**stats["account"], "total_value": max(current_total - fees, 0)}}
+        risk_check = _legacy_validate_trades({**decision, "trades": legacy_trades}, risk_stats)
+    else:
+        risk_check = {"post_trade": [], "post_trade_risk": {}, "breaches": [], "sleeves": {},
+                      "ending_cash_pct": None}
+    ending_cash = effective.get("ending_cash")
+    ending_pct = (ending_cash / (current_total - fees) * 100
+                  if ending_cash is not None and isinstance(current_total, (int, float))
+                  and current_total > fees else None)
+    if ending_cash is not None:
+        risk_check["ending_cash"] = ending_cash
+        risk_check["ending_cash_pct"] = round(ending_pct, 1) if ending_pct is not None else None
+        # The risk simulation is marked at current quotes; charge order fees against its denominator.
+        if risk_check.get("post_trade"):
+            cash_row = next((p for p in risk_check["post_trade"] if p.get("ticker") == "cash"), None)
+            if cash_row:
+                cash_row["value_after"] = ending_cash
+                cash_row["weight_after_pct"] = risk_check["ending_cash_pct"]
+    else:
+        risk_check["ending_cash"] = None
+        risk_check["ending_cash_pct"] = None
+    risk_check.update({
+        "trades": effective.get("trades", []),
+        "warnings": list(dict.fromkeys((risk_check.get("warnings") or []) + (effective.get("warnings") or []))),
+        "fees_usd": fees,
+        "trade_policy": effective.get("trade_policy", stats.get("trade_policy") or parse_trade_policy({})),
+        "accounts_after": effective.get("accounts_after", []),
+        "validated": True,
+        "execution_assumption": effective.get("execution_assumption"),
+    })
+    return risk_check
+
+
 def diff_plans(draft: dict | None, final: dict | None) -> list[dict]:
     if not draft or not final:
         return []
 
     def m(p):
-        return {t["ticker"]: (t["action"], int(t.get("shares") or 0)) for t in p.get("trades", [])}
+        rows = p.get("trades")
+        if not isinstance(rows, list):
+            return {}
+        out = {}
+        for i, trade in enumerate(rows):
+            if not isinstance(trade, dict):
+                continue
+            raw_ticker = str(trade.get("ticker") or "").strip().upper()
+            ticker = raw_ticker or f"<missing ticker row {i + 1}>"
+            raw_account_id = trade.get("account_id")
+            if raw_account_id is None:
+                account_id = None
+            elif isinstance(raw_account_id, (str, int, float)) and not isinstance(raw_account_id, bool):
+                account_id = str(raw_account_id)
+            else:
+                account_id = f"<invalid account row {i + 1}>"
+            action = str(trade.get("action") or "<missing action>").strip().upper()
+            raw_shares = trade.get("shares")
+            if isinstance(raw_shares, bool) or raw_shares is None:
+                shares = f"invalid({'missing' if raw_shares is None else raw_shares})"
+            else:
+                try:
+                    qty = float(raw_shares)
+                except (TypeError, ValueError, OverflowError):
+                    qty = math.nan
+                if not math.isfinite(qty):
+                    shares = f"invalid({html.escape(_cell(raw_shares, 40))})"
+                else:
+                    shares = str(int(qty)) if qty.is_integer() else repr(qty)
+            out[(account_id, ticker)] = (action, shares)
+        return out
     a, b = m(draft), m(final)
     out = []
-    for tk in dict.fromkeys(list(a) + list(b)):
-        da, fa = a.get(tk, ("HOLD", 0)), b.get(tk, ("HOLD", 0))
+    for key in dict.fromkeys(list(a) + list(b)):
+        da, fa = a.get(key, ("HOLD", 0)), b.get(key, ("HOLD", 0))
         if da != fa:
-            out.append({"ticker": tk, "draft": f"{da[0]} {da[1]}", "final": f"{fa[0]} {fa[1]}"})
+            account_id, ticker = key
+            out.append({"ticker": ticker, "account_id": account_id,
+                        "draft": f"{_cell(da[0], 40)} {_cell(da[1], 60)}",
+                        "final": f"{_cell(fa[0], 40)} {_cell(fa[1], 60)}"})
     dc = (draft.get("cash_decision") or {}).get("target_cash_pct")
     fc = (final.get("cash_decision") or {}).get("target_cash_pct")
     if dc != fc:
@@ -1524,6 +1949,22 @@ def fmt_money(x):
     return "n/a" if x is None else f"${x:,.0f}"
 
 
+def fmt_number(x, places=2):
+    return "n/a" if x is None else f"{x:,.{places}f}"
+
+
+def fmt_quantity(x):
+    if x is None:
+        return "n/a"
+    try:
+        value = float(x)
+    except (TypeError, ValueError, OverflowError):
+        return html.escape(_cell(x, 40), quote=True) or "n/a"
+    if not math.isfinite(value):
+        return "n/a"
+    return str(int(value)) if value.is_integer() else repr(value)
+
+
 def _cell(x, n=220):
     return _clip(str(x) if x is not None else "", n)
 
@@ -1531,17 +1972,23 @@ def _cell(x, n=220):
 def render_plan_trades(L, plan, check, targets, sleeve=None):
     order = {tk: i for i, tk in enumerate(plan.get("priority_order", []))}
     trades = sorted(check["trades"], key=lambda t: order.get(t["ticker"], 99))
-    L.append("| # | Ticker | Proposed role | Decision | Action | Shares | Est. price | Value | Order | Limit | Timing | Agent rating | vs agent | Rationale |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("| # | Account | Ticker | Proposed role | Decision | Action | Proposed shares | Effective shares | Est. price | Value | Fee | Status | Reason | Order | Limit | Timing | Agent rating | vs agent | Rationale |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for i, t in enumerate(trades, 1):
-        L.append(f"| {i} | {t['ticker']}{'' if t.get('is_holding', True) else ' (new)'} | {t.get('investment_role', 'unassigned')} | {t.get('decision', '')} | "
-                 f"{t['action']} | {t['shares']} | ${t['calc_price']:,.2f} | {fmt_money(t['value_usd'])} | "
+        L.append(f"| {i} | {_cell(t.get('account_id'), 80)} | {t['ticker']}{'' if t.get('is_holding', True) else ' (new)'} | {t.get('investment_role', 'unassigned')} | {t.get('decision', '')} | "
+                 f"{t['action']} | {fmt_quantity(t.get('proposed_shares', t.get('shares')))} | {fmt_quantity(t.get('effective_shares', t.get('shares')))} | {fmt_number(t.get('calc_price'))} | {fmt_money(t.get('value_usd'))} | {fmt_money(t.get('fee_usd'))} | {t.get('status', 'accepted')} | {_cell(t.get('reason'), 180)} | "
                  f"{t.get('order_type', '')} | {'' if t.get('limit_price') in (None, 0) else t['limit_price']} | "
                  f"{_cell(t.get('timing'), 160)} | {t.get('agent_rating', '')} | {t.get('follows_agent', '')} | "
                  f"{_cell(t.get('rationale'), 400)} |")
     L.append(f"\nPriority order: {' -> '.join(plan.get('priority_order', []))}\n")
     L.append("### Post-trade check (computed by the add-on, not the model)")
-    L.append(f"Ending cash: **{fmt_money(check['ending_cash'])} ({check['ending_cash_pct']}%)**")
+    policy = check.get("trade_policy") or {}
+    L.append("Trade policy: "
+             f"${fmt_number(policy.get('fee_per_order_usd'), 2)} per order; "
+             f"${fmt_number(policy.get('min_buy_notional_usd'), 2)} minimum buy; "
+             f"${fmt_number(policy.get('min_residual_notional_usd'), 2)} residual guideline.")
+    L.append(f"Order fees: **{fmt_money(check.get('fees_usd', 0))}**")
+    L.append(f"Ending cash: **{fmt_money(check.get('ending_cash'))} ({fmt_number(check.get('ending_cash_pct'), 1)}%)**")
     risk = check.get("post_trade_risk") or {}
     if risk:
         L.append(f"Post-trade beta (code): **{risk.get('beta_spy')}** | AI look-through **{risk.get('ai_lookthrough_pct')}%** "
@@ -1566,7 +2013,8 @@ def render_plan_trades(L, plan, check, targets, sleeve=None):
         L.append(f"| {a['ticker']}{' (new)' if a['is_new'] else ''} | {sh} | {fmt_money(a['value_after'])} | {a['weight_after_pct']}% | {tg} |")
 
 
-def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, final, check_d, check_f, targets) -> str:
+def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, final, check_d, check_f, targets,
+                    no_llm: bool | None = None) -> str:
     L = []
     acct = stats["account"]
     pol = stats["cash_policy"]
@@ -1578,8 +2026,11 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
              f"`{models['neutral']}` | prices as of {stats['as_of_prices']} | decision support, not financial advice._\n")
     if models.get("note"):
         L.append(f"_{models['note']}_\n")
-    if not plan:
+    requested_snapshot = (not calls) if no_llm is None else no_llm
+    if not plan and requested_snapshot:
         L.append("_LLM step skipped (--no-llm). Quantitative snapshot only._\n")
+    elif not plan:
+        L.append("_Fund manager response did not produce a schema-valid plan; this run is incomplete._\n")
     else:
         stage = "FINAL (after risk-committee debate)" if final else "DRAFT (no debate run)"
         L.append(f"## Verdict - {stage}\n**{plan.get('headline', '')}**  (confidence: {plan.get('confidence', 'n/a')})\n")
@@ -1587,7 +2038,7 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
         L.append("## Cash decision")
         L.append(f"> **Proposed cash: {cd.get('target_cash_pct')}%** (configured safeguard range {pol['min_pct']}-{pol['max_pct']}%, not an owner-approved target; soft default "
                  f"{pol['soft_default_pct']}%) | regime: **{cd.get('regime')}** | post-trade cash: "
-                 f"**{fmt_money(check['ending_cash'])} ({check['ending_cash_pct']}%)** | current {acct['cash_pct']}%")
+                 f"**{fmt_money(check.get('ending_cash'))} ({fmt_number(check.get('ending_cash_pct'), 1)}%)** | current {fmt_number(acct.get('cash_pct'), 1)}%")
         if final and draft:
             L.append(f"> Draft target was {(draft.get('cash_decision') or {}).get('target_cash_pct')}%; risk team views: "
                      + ", ".join(f"{t['role']} {((t['parsed'] or {}).get('cash_view') or {}).get('target_cash_pct')}%"
@@ -1614,7 +2065,7 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
                 L.append("\nDebate points and the manager's response:")
                 L += [f"- [{t['analyst']}] {t['point']} - **{t['accepted']}**: {t['response']}" for t in final["debate_takeaways"]]
             L.append("")
-        L.append("## Final trades (whole shares)" if final else "## Trades (whole shares)")
+        L.append("## Final trades (account-scoped)" if final else "## Trades (account-scoped)")
         render_plan_trades(L, plan, check, targets, (stats.get("risk_policy") or {}).get("ai_sleeve"))
         if plan.get("swaps_considered"):
             L.append("\n## Swaps considered (holdings -> watchlist)")
@@ -1677,35 +2128,38 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
     L.append("\n---\n## Appendix A - Portfolio snapshot")
     L.append(f"Total {fmt_money(acct['total_value'])} | invested {fmt_money(acct['invested'])} | cash "
              f"{fmt_money(acct['cash'])} ({acct['cash_pct']}%) | unrealized P&L {fmt_money(acct['unrealized_pnl'])}\n")
-    L.append("| Ticker | Shares | Avg cost | Price | Value | Weight | P&L % | 1m % | 3m % | vs SMA200 | Vol % | Beta 1y / 2y | Corr SPY 1y / 2y | Theme | Sub-theme | Agent rating |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    if stats.get("accounts"):
+        L.append("Accounts: " + "; ".join(
+            f"{_cell(a.get('label') or a.get('account_id'), 100)} ({_cell(a.get('broker'), 40)}): "
+            f"cash {fmt_money(a.get('cash'))}; "
+            + ", ".join(f"{p.get('ticker')} {p.get('quantity', 0):g} shares"
+                          f" at avg cost {fmt_number(p.get('average_price'))}"
+                          for p in a.get("positions", []))
+            for a in stats["accounts"]))
+    L.append("| Ticker | Shares | Avg cost | Price | Value | Weight | P&L % | 1m % | 3m % | vs SMA200 | Vol % | Beta 1y / 2y | Corr SPY 1y / 2y | Theme | Agent rating |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in sorted(stats["positions"], key=lambda r: -(r["weight_pct"] or 0)):
-        L.append(f"| {r['ticker']} | {r['quantity']:g} | {r['avg_cost']:.2f} | {r['price'] or 0:.2f} | "
-                 f"{fmt_money(r['market_value'])} | {r['weight_pct']:.1f}% | {r['unrealized_pnl_pct'] or 0:.1f} | "
+        L.append(f"| {r['ticker']} | {r['quantity']:g} | {fmt_number(r['avg_cost'])} | {fmt_number(r['price'])} | "
+                 f"{fmt_money(r['market_value'])} | {fmt_number(r['weight_pct'], 1)}% | {fmt_number(r['unrealized_pnl_pct'], 1)} | "
                  f"{r.get('ret_1m_pct', '')} | {r.get('ret_3m_pct', '')} | {r.get('vs_sma200_pct', '')}% | {r.get('ann_vol_pct', '')} | "
                  f"{r.get('beta_1y', '')} / {r.get('beta_2y', '')}{' ⚠' if r.get('beta_unstable') else ''} | "
-                 f"{r.get('corr_spy_1y', '')} / {r.get('corr_spy_2y', '')} | {r['theme']} | {r.get('sub_theme') or ''} | "
+                 f"{r.get('corr_spy_1y', '')} / {r.get('corr_spy_2y', '')} | {r['theme']} | "
                  f"{reports.get(r['ticker'], {}).get('pm_rating', 'n/a')} |")
     rk = stats["risk"]
-    L.append(f"\n**Risk:** portfolio vol {rk['portfolio_ann_vol_pct']}%/yr (SPY {rk['spy_ann_vol_pct']}%), beta "
-             f"{rk['portfolio_beta_spy_1y']} (1y) / {rk['portfolio_beta_spy_2y']} (2y), 1y max drawdown at current weights "
-             f"{rk['max_drawdown_1y_current_weights_pct']}%, 1-day 95% VaR {fmt_money(rk['var95_1d_usd'])}.")
-    L.append("Risk contribution: " + ", ".join(f"{k} {v}%" for k, v in rk["risk_contribution_pct"].items()))
-    L.append("\n**Stress** (beta-scaled uses the higher of 1y/2y beta): " + "; ".join(
-        f"{k}: {fmt_money(v['pnl_usd'])} ({v['pnl_pct_of_account']}%)" + (f" [{v['window']}, SPY {v['spy_move_pct']}%]" if 'window' in v else "")
-        for k, v in stats["stress"].items()))
+    if stats["account"].get("whole_book_available"):
+        L.append(f"\n**Risk:** portfolio vol {rk['portfolio_ann_vol_pct']}%/yr (SPY {rk['spy_ann_vol_pct']}%), beta "
+                 f"{rk['portfolio_beta_spy_1y']} (1y) / {rk['portfolio_beta_spy_2y']} (2y), 1y max drawdown at current weights "
+                 f"{rk['max_drawdown_1y_current_weights_pct']}%, 1-day 95% VaR {fmt_money(rk['var95_1d_usd'])}.")
+        L.append("Risk contribution: " + ", ".join(f"{k} {v}%" for k, v in rk["risk_contribution_pct"].items()))
+        L.append("\n**Stress** (beta-scaled uses the higher of 1y/2y beta): " + "; ".join(
+            f"{k}: {fmt_money(v['pnl_usd'])} ({v['pnl_pct_of_account']}%)" + (f" [{v['window']}, SPY {v['spy_move_pct']}%]" if 'window' in v else "")
+            for k, v in stats["stress"].items()))
+    else:
+        L.append("\n**Risk:** cash-inclusive whole-book weights, volatility, VaR and stress are unavailable because USD cash or a holding quote is unknown.")
     c = stats["concentration"]
-    L.append(f"\n**Concentration:** effective positions {c['effective_positions']}, top 3 "
+    L.append(f"\n**Concentration ({c.get('basis', 'whole book')}):** effective positions {c['effective_positions']}, top 3 "
              + ", ".join(f"{t['ticker']} {t['weight_pct']}%" for t in c["top3"])
              + ". Buckets: " + ", ".join(f"{k} {v}%" for k, v in c["by_bucket_pct"].items()))
-    L.append("\n### AI sub-themes")
-    L.append("Direct weight of tagged holdings. This table is not the sleeve look-through. "
-             "SPY's configured fraction stays in the look-through and is not split across sub-themes. "
-             "A holding with no sub-theme is omitted.")
-    L.append("| Sub-theme | Weight | Value | Holdings |\n|---|---|---|---|")
-    for bucket in stats.get("ai_subthemes") or []:
-        names = ", ".join(f"{t['ticker']} {t['weight_pct']}%" for t in bucket["tickers"]) or "—"
-        L.append(f"| {bucket['label']} | {bucket['weight_pct']}% | {fmt_money(bucket['market_value'])} | {names} |")
     L.append(f"\n**Correlation clusters (stocks linked by pairwise corr >= {stats['correlation_threshold']}, SPY excluded):** " + (
         "; ".join(f"{', '.join(g['tickers'])} (avg {g['avg_pairwise_corr']})" for g in stats["correlation_clusters"]) or "none"))
     def _fmt_regime(k, v):
@@ -1732,11 +2186,11 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
                      f"{x['drift_pct']:+}% | {x.get('shares_to_target', '')} |")
     if stats.get("watchlist"):
         L.append("\n### Watchlist candidates (not held)")
-        L.append(f"| Ticker | Sector | Type | Sub-theme | Price | 1m % | 3m % | 1y % | vs SMA200 | Vol % | Beta 1y | Corr to book | Avg corr to holdings | Vol change +3% from cash (pp) | Vol change swap 3% out of {stats.get('watchlist_swap_source')} (pp) | Agent rating |")
+        L.append(f"| Ticker | Sector | Type | Price | 1m % | 3m % | 1y % | vs SMA200 | Vol % | Beta 1y | Corr to book | Avg corr to holdings | Vol change +3% from cash (pp) | Vol change swap 3% out of {stats.get('watchlist_swap_source')} (pp) | Agent rating |")
         L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for w in stats["watchlist"]:
             swap = next((v for k, v in w.items() if k.startswith("port_vol_change_pp_swap")), "")
-            L.append(f"| {w['ticker']} | {w.get('sector') or ''} | {w.get('type') or ''} | {w.get('sub_theme') or ''} | {w.get('price') or 0:.2f} | "
+            L.append(f"| {w['ticker']} | {w.get('sector') or ''} | {w.get('type') or ''} | {w.get('price') or 0:.2f} | "
                      f"{w.get('ret_1m_pct', '')} | {w.get('ret_3m_pct', '')} | {w.get('ret_1y_pct', '')} | {w.get('vs_sma200_pct', '')} | "
                      f"{w.get('ann_vol_pct', '')} | {w.get('beta_1y', '')} | {w.get('corr_to_book_1y', '')} | "
                      f"{w.get('avg_corr_to_holdings_1y', '')} | {w.get('port_vol_change_pp_add3pct_from_cash', '')} | {swap} | "
@@ -1814,11 +2268,21 @@ def main() -> int:
     ap.add_argument("--no-llm", action="store_true", help="quant snapshot only, no model call")
     args = ap.parse_args()
 
-    book = load_json(Path(args.book))
-    if not book:
+    raw_book = load_json(Path(args.book))
+    if not raw_book:
         log(f"book not found: {args.book}")
         return 2
+    try:
+        book = normalize_book(raw_book)
+    except PortfolioBookError as exc:
+        log(f"invalid portfolio book: {exc}")
+        return 2
     targets = load_json(Path(args.targets)) or {}
+    try:
+        trade_policy = parse_trade_policy(targets)
+    except TradePolicyError as exc:
+        log(f"invalid trade policy: {exc}")
+        return 2
     themes = load_json(Path(args.themes), {"themes": {}, "buckets": {}})
     tickers = [p["ticker"] for p in book["positions"]]
     cp = targets.get("cash_policy") or {}
@@ -1856,6 +2320,7 @@ def main() -> int:
         log("FRED macro snapshot ...")
         macro = fred_snapshot(args.date)
     stats = build_stats(book, close, quotes, themes, targets, meta, args.corr_threshold, watchlist, reports, macro, cash_policy, args.date)
+    stats["trade_policy"] = trade_policy
     stats["scout_source"] = {key: scout_report.get(key) for key in
                              ("status", "date", "age_days", "generated_utc") if scout_report.get(key) is not None}
     if scout_report["status"] == "missing":
@@ -1867,7 +2332,7 @@ def main() -> int:
     elif scout_report["status"] == "unavailable":
         stats["data_checks"].append(scout_report.get("error") or "Theme scout report is unavailable")
     acct = stats["account"]
-    log(f"account ${acct['total_value']:,.0f} (cash {acct['cash_pct']}%), vol {stats['risk']['portfolio_ann_vol_pct']}%, "
+    log(f"account {fmt_money(acct['total_value'])} (cash {fmt_number(acct['cash_pct'], 1)}%), vol {stats['risk']['portfolio_ann_vol_pct']}%, "
         f"beta {stats['risk']['portfolio_beta_spy_1y']} (1y) / {stats['risk']['portfolio_beta_spy_2y']} (2y)")
     for msg in stats["data_checks"]:
         log(f"  data check: {msg}")
@@ -1907,41 +2372,71 @@ def main() -> int:
                       "Opus on a non-conservative seat is a warning, not a block. Neutral is kept different from the fund manager."}
     eff = lambda e: None if e in (None, "none") else e  # noqa: E731
     calls, draft, debate, final, check_d, check_f = [], None, [], None, None, None
+    review_outcome = "snapshot" if args.no_llm else "complete"
+    incomplete_stage = incomplete_error = None
+    attempt_path = out_dir / "response_attempts.jsonl"
     if not args.no_llm:
-        log(f"[1/3] fund manager DRAFT ({fm_spec['model']}, prompt ~{len(context) // 4:,} tokens) ...")
-        r = call_llm(fm_spec["model"], fm_spec["system"], context + "\n\n## Task\nWrite your DRAFT whole-portfolio plan. Every holding must "
-                     "appear exactly once in `trades` (HOLD 0 if unchanged); add watchlist buys only if justified.",
-                     DRAFT_SCHEMA, "fund_manager_draft", fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/draft",
-                     fm_spec.get("temperature"))
-        r["model_req"] = args.model
-        calls.append(r)
-        draft = r["parsed"]
-        if draft:
-            check_d = validate_trades(draft, stats)
-        if draft and args.risk_rounds > 0:
-            log(f"[2/3] risk committee debate, {args.risk_rounds} round(s) ...")
-            debate = run_debate(context, {**draft, "_post_trade_check": check_d}, plan, args.risk_rounds, args.date)
-            calls += [{"label": f"risk/{t['role']} r{t['round']}", "model_req": t["model"], "mode": t["mode"],
-                       "seconds": t["seconds"], "usage": t["usage"]} for t in debate]
-            log("[3/3] fund manager FINAL ...")
-            deb_txt = "\n\n".join(f"[Round {t['round']}] {t['role'].upper()} ({t['model']}):\n"
-                                  + json.dumps(t["parsed"] or t["content"], indent=1) for t in debate)
-            user = (context + "\n\n## Your DRAFT plan\n" + json.dumps(draft, indent=1)
-                    + "\n\n## Post-trade check of the draft (computed)\n" + json.dumps(check_d, indent=1)
-                    + "\n\n## Portfolio risk committee debate\n" + deb_txt
-                    + "\n\n## Task\nIssue the FINAL whole-portfolio plan. Weigh each analyst's points on their merits "
-                      "(do not just average), revisit the cash target, and list every change vs the draft with the reason "
-                      "in `changes_vs_draft` (empty list if none). Summarise how you treated the key debate points in "
-                      "`debate_takeaways`. Every holding must appear exactly once in `trades`.")
-            r = call_llm(fm_spec["model"], fm_spec["system"], user, FINAL_SCHEMA, "fund_manager_final",
-                         fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/final", fm_spec.get("temperature"))
+        stage = "draft"
+        try:
+            log(f"[1/3] fund manager DRAFT ({fm_spec['model']}, prompt ~{len(context) // 4:,} tokens) ...")
+            r = call_llm(fm_spec["model"], fm_spec["system"], context + "\n\n## Task\nWrite your DRAFT whole-portfolio plan. Every holding must "
+                         "appear exactly once in `trades` (HOLD 0 if unchanged); add watchlist buys only if justified.",
+                         DRAFT_SCHEMA, "fund_manager_draft", fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/draft",
+                         fm_spec.get("temperature"), attempt_path)
             r["model_req"] = args.model
             calls.append(r)
-            final = r["parsed"]
-            if final:
-                check_f = validate_trades(final, stats)
+            candidate_draft = r["parsed"]
+            if candidate_draft is None:
+                raise RuntimeError("no response passed structured schema validation; raw response was preserved")
+            try:
+                candidate_check_d = validate_candidate(candidate_draft, stats, r["label"], attempt_path,
+                                                       r.get("attempt_id"))
+            except Exception as exc:
+                raise RuntimeError(f"draft failed deterministic trade validation: {exc}") from exc
+            draft, check_d = candidate_draft, candidate_check_d
+            if args.risk_rounds > 0:
+                stage = "risk_debate"
+                log(f"[2/3] risk committee debate, {args.risk_rounds} round(s) ...")
+                debate = []
+                run_debate(context, {**draft, "_post_trade_check": check_d}, plan,
+                            args.risk_rounds, args.date, attempt_path, debate)
+                stage = "final"
+                log("[3/3] fund manager FINAL ...")
+                deb_txt = "\n\n".join(f"[Round {t['round']}] {t['role'].upper()} ({t['model']}):\n"
+                                          + json.dumps(t["parsed"] or t["content"], indent=1) for t in debate)
+                user = (context + "\n\n## Your DRAFT plan\n" + json.dumps(draft, indent=1)
+                        + "\n\n## Post-trade check of the draft (computed)\n" + json.dumps(check_d, indent=1)
+                        + "\n\n## Portfolio risk committee debate\n" + deb_txt
+                        + "\n\n## Task\nIssue the FINAL whole-portfolio plan. Weigh each analyst's points on their merits "
+                          "(do not just average), revisit the cash target, and list every change vs the draft with the reason "
+                          "in `changes_vs_draft` (empty list if none). Summarise how you treated the key debate points in "
+                          "`debate_takeaways`. Every holding must appear exactly once in `trades`.")
+                r = call_llm(fm_spec["model"], fm_spec["system"], user, FINAL_SCHEMA, "fund_manager_final",
+                             fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/final", fm_spec.get("temperature"), attempt_path)
+                r["model_req"] = args.model
+                calls.append(r)
+                candidate_final = r["parsed"]
+                if candidate_final is None:
+                    raise RuntimeError("final review returned no response passing structured schema validation; raw response was preserved")
+                try:
+                    candidate_check_f = validate_candidate(candidate_final, stats, r["label"], attempt_path, r.get("attempt_id"))
+                except Exception as exc:
+                    raise RuntimeError(f"final plan failed deterministic trade validation: {exc}") from exc
+                final, check_f = candidate_final, candidate_check_f
+        except Exception as exc:  # Save all completed evidence, then fail the runner honestly.
+            review_outcome = "incomplete"
+            incomplete_stage = stage
+            incomplete_error = str(exc)[:1000]
+            log(f"fund manager review incomplete at {stage}: {incomplete_error}")
 
-    md = render_markdown(args.date, models, stats, reports, macro, calls, draft, debate, final, check_d, check_f, targets)
+    md = render_markdown(args.date, models, stats, reports, macro, calls, draft, debate, final,
+                         check_d, check_f, targets, no_llm=args.no_llm)
+    if review_outcome == "incomplete":
+        md += f"\n\n## Review status\n\n**INCOMPLETE** at `{incomplete_stage}`: {incomplete_error}\n"
+        for output in _unvalidated_outputs(attempt_path):
+            md += f"\n### Unvalidated model output — {output.get('label')} ({output.get('mode')})\n\n{output['content']}\n"
+    elif review_outcome == "snapshot":
+        pass  # render_markdown labels intentional --no-llm snapshots.
     stem = "portfolio_snapshot" if args.no_llm else "portfolio_report"
     (out_dir / f"{stem}.md").write_text(md, encoding="utf-8")
     payload = {"date": args.date, "run_id": run_id, "models": models,
@@ -1951,7 +2446,11 @@ def main() -> int:
                "stats": stats, "macro": macro, "draft": draft, "draft_check": check_d, "debate": debate,
                "final": final, "final_check": check_f, "diff_vs_draft": diff_plans(draft, final),
                "llm_calls": [{k: v for k, v in c.items() if k not in ("content", "parsed")} for c in calls],
-               "raw_text_fallbacks": [c["content"] for c in calls if c.get("mode") == "text"]}
+               "raw_text_fallbacks": [c["content"] for c in calls if c.get("parsed") is None and c.get("content")],
+               "review_outcome": review_outcome, "incomplete_stage": incomplete_stage,
+               "incomplete_error": incomplete_error,
+               "unvalidated_outputs": _unvalidated_outputs(attempt_path),
+               "response_attempts": _attempt_summaries(attempt_path)}
     (out_dir / f"{stem}.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     latest = {"date": args.date, "run_id": run_id, "path": f"{args.date}/{run_id}",
               "kind": "snapshot" if args.no_llm else "report",
@@ -1959,16 +2458,16 @@ def main() -> int:
     (Path(args.out_dir) / "latest.json").write_text(json.dumps(latest, indent=2), encoding="utf-8")
 
     print("\n" + "=" * 70)
-    print(f"FUND MANAGER - {args.date}   account ${acct['total_value']:,.0f}")
+    print(f"FUND MANAGER - {args.date}   account {fmt_money(acct['total_value'])}")
     plan, chk = (final, check_f) if final else (draft, check_d)
     if plan and chk:
         print(("FINAL: " if final else "DRAFT: ") + plan.get("headline", ""))
         cd = plan.get("cash_decision") or {}
-        print(f"  target cash {cd.get('target_cash_pct')}% ({cd.get('regime')}), post-trade cash ~${chk['ending_cash']:,.0f} ({chk['ending_cash_pct']}%)")
+        print(f"  target cash {cd.get('target_cash_pct')}% ({cd.get('regime')}), post-trade cash ~{fmt_money(chk.get('ending_cash'))} ({fmt_number(chk.get('ending_cash_pct'), 1)}%)")
         order = {tk: i for i, tk in enumerate(plan.get("priority_order", []))}
         for t in sorted(chk["trades"], key=lambda t: order.get(t["ticker"], 99)):
             if t["action"] != "HOLD" and t["shares"]:
-                print(f"  {t['action']:4s} {t['shares']:>4d} {t['ticker']:6s} ~${t['value_usd']:>9,.0f}  ({t.get('decision', '')})")
+                print(f"  {t['action']:4s} {t['shares']:>6g} {t['ticker']:6s} ~{fmt_money(t.get('value_usd')):>9s}  ({t.get('decision', '')})")
         for d in diff_plans(draft, final):
             print(f"  changed vs draft: {d['ticker']}: {d['draft']} -> {d['final']}")
         risk = chk.get("post_trade_risk") or {}
@@ -1981,7 +2480,7 @@ def main() -> int:
               f"cost ~${sum((c.get('usage') or {}).get('cost') or 0 for c in calls):.2f}")
     print(f"report: {out_dir / (stem + '.md')}")
     print("=" * 70)
-    return 0
+    return 1 if review_outcome == "incomplete" else 0
 
 
 if __name__ == "__main__":

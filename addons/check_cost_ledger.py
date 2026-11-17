@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -81,6 +83,79 @@ def main() -> int:
     assert len(label_records) == len(labels), label_records
     label_week = cl.weekly_spend(label_root, datetime.now(timezone.utc).date())
     assert label_week["spent_usd"] == 1.0 and len(label_week["runs"]) == len(labels), label_week
+
+    # Journal reconciliation is part of the budget read path. Complete zero-token
+    # usage is accepted; torn and incomplete responses fail closed with line context.
+    journal_root = Path(tempfile.mkdtemp(prefix="cost_ledger_journal_"))
+    journal_dir = journal_root / "fund_manager" / "2026-11-17" / "fixture"
+    journal_dir.mkdir(parents=True)
+    journal = journal_dir / "response_attempts.jsonl"
+    complete = {"event": "response", "attempt_id": "zero-usage-attempt", "label": "fm/draft",
+                "model_returned": "openai/gpt-6.1-sol", "created_utc": "2026-11-17T12:00:00Z",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "cost": 0}}
+    missing = {"event": "response", "label": "fm/final", "model_returned": "openai/gpt-6.1-sol",
+               "created_utc": "2026-11-17T12:01:00Z", "usage": {}}
+    journal.write_text("{\"event\":\"response\",\n" + json.dumps(missing) + "\n"
+                       + json.dumps(complete) + "\n", encoding="utf-8")
+    reconciled = cl.reconcile_attempt_journals(journal_root)
+    assert reconciled["response_count"] == 2
+    assert len(reconciled["failures"]) == 2, reconciled
+    assert all(str(journal) in failure and any(f":{line_no}:" in failure for line_no in (1, 2))
+               for failure in reconciled["failures"]), reconciled["failures"]
+    assert any("usage.prompt_tokens" in failure and "usage.completion_tokens" in failure
+               for failure in reconciled["failures"]), reconciled["failures"]
+    assert len(list(cl.costs_dir(journal_root).glob("attempt_*.json"))) == 1
+    fail_closed = cl.evaluate(journal_root, datetime(2026, 11, 17).date(), "fund_manager", next_usd=0)
+    assert fail_closed["ok"] is False and fail_closed["reconciliation_failures"], fail_closed
+
+    corrupt_root = Path(tempfile.mkdtemp(prefix="cost_ledger_corrupt_attempt_"))
+    corrupt_dir = corrupt_root / "fund_manager" / "2026-11-17" / "fixture"
+    corrupt_dir.mkdir(parents=True)
+    corrupt_journal = corrupt_dir / "response_attempts.jsonl"
+    attempts = []
+    for attempt_id in ("unreadable-ledger-attempt", "mismatched-ledger-attempt"):
+        attempts.append({"event":"response", "attempt_id":attempt_id, "label":"fm/draft",
+                         "model_returned":"openai/gpt-6.1-sol", "created_utc":"2026-11-17T13:00:00Z",
+                         "usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.2}})
+    corrupt_journal.write_text("".join(json.dumps(row) + "\n" for row in attempts), encoding="utf-8")
+    corrupt_cost_dir = cl.costs_dir(corrupt_root)
+    corrupt_cost_dir.mkdir(parents=True)
+    unreadable_path = corrupt_cost_dir / ("attempt_" + hashlib.sha256(attempts[0]["attempt_id"].encode()).hexdigest() + ".json")
+    unreadable_bytes = b"{truncated ledger record"
+    unreadable_path.write_bytes(unreadable_bytes)
+    mismatch_path = corrupt_cost_dir / ("attempt_" + hashlib.sha256(attempts[1]["attempt_id"].encode()).hexdigest() + ".json")
+    mismatch_path.write_text(json.dumps({"attempt_id":"different-attempt", "cost_usd":0}), encoding="utf-8")
+    corrupt_reconcile = cl.reconcile_attempt_journals(corrupt_root)
+    assert len(corrupt_reconcile["failures"]) == 2, corrupt_reconcile
+    assert any("unreadable" in failure for failure in corrupt_reconcile["failures"])
+    assert any("does not match journaled usage" in failure for failure in corrupt_reconcile["failures"])
+    assert unreadable_path.read_bytes() == unreadable_bytes, "reconciliation must not overwrite corrupt ledgers"
+    corrupt_budget = cl.evaluate(corrupt_root, datetime(2026, 11, 17).date(), "fund_manager", next_usd=0)
+    assert corrupt_budget["ok"] is False and corrupt_budget["reconciliation_failures"], corrupt_budget
+
+    repriced_root = Path(tempfile.mkdtemp(prefix="cost_ledger_repriced_attempt_"))
+    repriced_dir = repriced_root / "fund_manager" / "2026-11-17" / "fixture"
+    repriced_dir.mkdir(parents=True)
+    repriced_journal = repriced_dir / "response_attempts.jsonl"
+    repriced_usage = {"prompt_tokens":1000,"completion_tokens":200}
+    original_pricing = {"model":"test/model", "tokens_in":1000, "tokens_out":200,
+                        "cost_usd":0.5, "cost_source":"price_table"}
+    with patch.object(cl, "cost_from_usage", return_value=original_pricing):
+        repriced_record = cl.write_chat_cost(repriced_root, label="fm/draft", model="test/model",
+                    usage=repriced_usage, analysis_date="2026-11-17", attempt_id="repriced-attempt",
+                    generated_utc="2026-11-17T14:00:00Z")
+    saved_before = repriced_record.read_bytes()
+    repriced_journal.write_text(json.dumps({"event":"response", "attempt_id":"repriced-attempt",
+        "label":"fm/draft", "model_returned":"test/model", "analysis_date":"2026-11-17",
+        "created_utc":"2026-11-17T14:00:00Z", "usage":repriced_usage}) + "\n", encoding="utf-8")
+    changed_pricing = {**original_pricing, "cost_usd":9.99}
+    with patch.object(cl, "cost_from_usage", return_value=changed_pricing):
+        repriced = cl.reconcile_attempt_journals(repriced_root)
+        spend_after_reprice = cl.weekly_spend(repriced_root, datetime(2026, 11, 17).date())
+    assert not repriced["failures"] and repriced["reconciled_count"] == 1, repriced
+    assert not spend_after_reprice["reconciliation_failures"], spend_after_reprice
+    assert repriced_record.read_bytes() == saved_before, "replay must preserve the original estimate"
+    assert json.loads(repriced_record.read_text())["cost_usd"] == 0.5
 
     root = Path(tempfile.mkdtemp(prefix="cost_ledger_"))
     targets = {"budget": {"weekly_usd": 25, "native_run_estimate_usd": 2, "fund_manager_estimate_usd": 1.5}}

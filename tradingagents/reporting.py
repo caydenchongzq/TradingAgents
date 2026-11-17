@@ -6,7 +6,7 @@ CLI and ``TradingAgentsGraph.save_reports`` both call this, so a headless / API
 run produces the same on-disk report tree a CLI run does.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from tradingagents.agents.rating import run_rating
@@ -24,7 +24,7 @@ def _header(ticker: str, final_state: dict, settings: dict | None) -> str:
         lines.append(f"- Analysis date: {final_state['trade_date']}")
     if final_state.get("final_trade_decision"):
         lines.append(f"- Rating: {run_rating(final_state)}")
-    lines.append(f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"- Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')}")
     if settings:
         s = settings.get
         deep_provider = s("deep_think_provider") or s("llm_provider", "?")

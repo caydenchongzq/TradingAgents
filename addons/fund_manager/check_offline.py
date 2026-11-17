@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -35,6 +37,71 @@ def _stats():
 
 
 def main() -> int:
+    import pandas as pd
+    import types
+    earnings_frame = pd.DataFrame({
+        "EPS Estimate": [1.25, 1.50], "Reported EPS": [1.40, float("nan")],
+        "Surprise(%)": [12.0, float("nan")],
+    }, index=pd.DatetimeIndex(["2026-11-05 16:30:00-05:00", "2026-11-20 16:30:00-05:00"]))
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.Ticker = lambda _ticker: types.SimpleNamespace(get_earnings_dates=lambda limit: earnings_frame)
+    with patch.dict("sys.modules", {"yfinance": fake_yf}):
+        earnings = fm._earnings_info("AAA", datetime.strptime("2026-11-10", "%Y-%m-%d").date())
+    assert earnings["last"] == "2026-11-05" and earnings["date"] == "2026-11-20", earnings
+    assert earnings["last_datetime"] == "2026-11-05T16:30:00-05:00", earnings
+    assert earnings["next_datetime"] == "2026-11-20T16:30:00-05:00", earnings
+    assert earnings["reported_eps"] == 1.4 and earnings["estimated_eps"] == 1.5, earnings
+    assert earnings["last_event"]["reported_eps"] == 1.4
+    assert earnings["next_event"]["estimated_eps"] == 1.5
+    assert earnings["fetched_at"].endswith("Z") and earnings["timing"] == "live"
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    same_day_frame = pd.DataFrame({
+        "EPS Estimate": [1.0, 1.5], "Reported EPS": [1.2, float("nan")],
+        "Surprise(%)": [20.0, float("nan")],
+    }, index=pd.DatetimeIndex([now - timedelta(minutes=10), now + timedelta(minutes=10)]))
+    fake_yf.Ticker = lambda _ticker: types.SimpleNamespace(get_earnings_dates=lambda limit: same_day_frame)
+    with patch.dict("sys.modules", {"yfinance": fake_yf}):
+        same_day = fm._earnings_info("AAA", now.date())
+    assert same_day["last_event"]["reported_eps"] == 1.2
+    assert same_day["last_event"]["surprise_percent"] == 20.0
+    assert same_day["next_event"]["estimated_eps"] == 1.5
+    past_local_future_date = now - timedelta(minutes=5)
+    past_local_future_date = past_local_future_date.astimezone(timezone(timedelta(hours=14)))
+    past_frame = pd.DataFrame({"EPS Estimate": [1.0], "Reported EPS": [1.2], "Surprise(%)": [20.0]},
+                              index=pd.DatetimeIndex([past_local_future_date]))
+    fake_yf.Ticker = lambda _ticker: types.SimpleNamespace(get_earnings_dates=lambda limit: past_frame)
+    with patch.dict("sys.modules", {"yfinance": fake_yf}):
+        past_with_old_anchor = fm._earnings_info("AAA", now.date() - timedelta(days=2))
+    assert past_with_old_anchor["last_event"]["reported_eps"] == 1.2
+    assert past_with_old_anchor["next_event"] is None
+    future_local_past_date = (now + timedelta(minutes=5)).astimezone(timezone(timedelta(hours=-16)))
+    future_frame = pd.DataFrame({"EPS Estimate": [1.5], "Reported EPS": [float("nan")], "Surprise(%)": [float("nan")]},
+                                index=pd.DatetimeIndex([future_local_past_date]))
+    fake_yf.Ticker = lambda _ticker: types.SimpleNamespace(get_earnings_dates=lambda limit: future_frame)
+    with patch.dict("sys.modules", {"yfinance": fake_yf}):
+        future_with_new_anchor = fm._earnings_info("AAA", now.date() + timedelta(days=1))
+    assert future_with_new_anchor["last_event"] is None
+    assert future_with_new_anchor["next_event"]["estimated_eps"] == 1.5
+    date_only_frame = pd.DataFrame({"EPS Estimate": [1.0, 1.5], "Reported EPS": [1.2, float("nan")],
+                                    "Surprise(%)": [20.0, float("nan")]},
+                                   index=pd.DatetimeIndex([
+                                       datetime.combine(now.date() - timedelta(days=1), datetime.min.time()),
+                                       datetime.combine(now.date() + timedelta(days=1), datetime.min.time()),
+                                   ]))
+    fake_yf.Ticker = lambda _ticker: types.SimpleNamespace(get_earnings_dates=lambda limit: date_only_frame)
+    with patch.dict("sys.modules", {"yfinance": fake_yf}):
+        date_only = fm._earnings_info("AAA", now.date() - timedelta(days=7))
+    assert date_only["last"] == (now.date() - timedelta(days=1)).isoformat(), date_only
+    assert date_only["date"] == (now.date() + timedelta(days=1)).isoformat(), date_only
+    assert date_only["last_datetime"] is None and date_only["next_datetime"] is None, date_only
+    today_frame = pd.DataFrame({"EPS Estimate": [1.5], "Reported EPS": [float("nan")],
+                                "Surprise(%)": [float("nan")]},
+                               index=pd.DatetimeIndex([datetime.combine(now.date(), datetime.min.time())]))
+    fake_yf.Ticker = lambda _ticker: types.SimpleNamespace(get_earnings_dates=lambda limit: today_frame)
+    with patch.dict("sys.modules", {"yfinance": fake_yf}):
+        date_only_today = fm._earnings_info("AAA", now.date() - timedelta(days=7))
+    assert date_only_today["date"] == now.date().isoformat()
+    assert date_only_today["next_datetime"] is None
     normalized_system = " ".join(fm.FM_SYSTEM.split())
     assert "not inherited percentage targets or owner-imposed limits" in normalized_system
     assert "without trying to satisfy an arbitrary percentage" in normalized_system
@@ -148,16 +215,132 @@ def main() -> int:
     assert half["ticker_weight"]["AAPL"] == 0.5 and half["ticker_weight"]["SPY"] == 0.33
     assert "ai_sleeve_cap_pct" not in fm._policy_with_sleeve({})
     assert "cap_pct" not in fm.resolve_ai_sleeve({"ai_sleeve": {"cap_pct": 42}})
-    table = fm.subtheme_table([
-        {"ticker": "NVDA", "sub_theme": "ai_compute_semis", "weight_pct": 12.5, "market_value": 1000},
-        {"ticker": "AMD", "sub_theme": "ai_compute_semis", "weight_pct": 2.5, "market_value": 200},
-        {"ticker": "AAPL", "sub_theme": None, "weight_pct": 3, "market_value": 300},
-    ], {"subthemes": {"ai_compute_semis": ["NVDA", "AMD"], "ai_energy": ["VST"]},
-        "subtheme_labels": {"ai_compute_semis": "AI compute & semis", "ai_energy": "AI energy"}})
-    by = {row["id"]: row for row in table}
-    assert by["ai_compute_semis"]["weight_pct"] == 15.0
-    assert by["ai_energy"]["weight_pct"] == 0.0
-    assert fm.subtheme_of("NVDA", {"subthemes": {"ai_compute_semis": ["NVDA"]}}) == "ai_compute_semis"
+    legacy_watch = Path(tempfile.mkdtemp()) / "watchlist.json"
+    legacy_watch.write_text(json.dumps([{"ticker": "NVDA", "sub_theme": "ai_compute_semis", "theme": "ai_growth"}]), encoding="utf-8")
+    normalized_watch = fm.load_watchlist(legacy_watch, [])
+    assert normalized_watch == [{"ticker": "NVDA", "sector": None, "type": None,
+                                 "theme": "ai_growth", "note": None}]
+    assert "sub_theme" not in fm.TRADE_ITEM["properties"]
+    assert "ai_subthemes" not in fm.build_stats.__code__.co_consts
+
+    import pandas as pd
+    idx_stats = pd.bdate_range("2025-01-01", periods=270)
+    close_stats = pd.DataFrame({"SPY": range(100, 370), "AAPL": range(50, 320)}, index=idx_stats, dtype=float)
+    with patch.object(fm, "_earnings_info", return_value=None):
+        unknown_book_stats = fm.build_stats(
+            {"schema_version": 2, "cash": None, "positions": [
+                {"ticker": "AAPL", "quantity": 10, "average_price": None, "accounts": ["sg"]}],
+             "accounts": [{"account_id": "sg", "broker": "moomoo", "cash": None,
+                           "positions": [{"ticker": "AAPL", "quantity": 10, "average_price": None}]}]},
+            close_stats, {"AAPL": {"price": 319.0}, "SPY": {"price": 369.0}},
+            {"themes": {}, "buckets": {}}, {}, {}, 0.5, [], {}, None,
+            {"min_pct": 0, "max_pct": 100, "soft_default_pct": 12}, "2026-11-06")
+    assert unknown_book_stats["account"]["total_value"] is None
+    assert unknown_book_stats["account"]["cash_pct"] is None
+    assert unknown_book_stats["positions"][0]["weight_pct"] is None
+    assert unknown_book_stats["positions"][0]["cost_basis"] is None
+    assert unknown_book_stats["risk"]["portfolio_ann_vol_pct"] is None
+    assert unknown_book_stats["stress"] == {}
+    assert unknown_book_stats["accounts"][0]["account_id"] == "sg"
+    for invalid_price in (float("nan"), float("inf"), 0.0):
+        with patch.object(fm, "_earnings_info", return_value=None):
+            invalid_quote_stats = fm.build_stats(
+                {"cash": 1000, "positions": [{"ticker": "AAPL", "quantity": 2, "average_price": 100}]},
+                close_stats, {"AAPL": {"price": invalid_price}}, {"themes": {}, "buckets": {}},
+                {}, {}, 0.5, [], {}, None,
+                {"min_pct": 0, "max_pct": 100, "soft_default_pct": 12}, "2026-11-06")
+        assert invalid_quote_stats["positions"][0]["price"] is None
+        assert invalid_quote_stats["positions"][0]["market_value"] is None
+        assert invalid_quote_stats["account"]["total_value"] is None
+        assert invalid_quote_stats["risk"]["portfolio_ann_vol_pct"] is None
+        json.dumps(invalid_quote_stats, allow_nan=False)
+    corr_idx = pd.bdate_range("2026-09-01", periods=35)
+    corr_close = pd.DataFrame({
+        "SPY": [100 + i * 0.7 + (i % 4) for i in range(35)],
+        "AAA": [50 + i * 1.2 + (i % 3) * 0.8 for i in range(35)],
+        "NEW": [20 + i * 0.5 + ((i * 3) % 5) for i in range(35)],
+    }, index=corr_idx, dtype=float)
+    with patch.object(fm, "_earnings_info", return_value=None):
+        unknown_cash_corr = fm.build_stats(
+            {"cash": None, "positions": [{"ticker": "AAA", "quantity": 5, "average_price": 40}]},
+            corr_close, {"AAA": {"price": 90.0}, "NEW": {"price": 40.0}, "SPY": {"price": 130.0}},
+            {"themes": {}, "buckets": {}}, {}, {}, 0.5, [{"ticker": "NEW", "type": "stock"}], {}, None,
+            {"min_pct": 0, "max_pct": 100, "soft_default_pct": 12}, str(corr_idx[-1].date()))
+    candidate_corr = unknown_cash_corr["watchlist"][0]["avg_corr_to_holdings_1y"]
+    assert candidate_corr is None or math.isfinite(candidate_corr)
+    json.dumps(unknown_cash_corr, allow_nan=False)
+    unknown_book_stats["trade_policy"] = fm.parse_trade_policy({})
+    unknown_decision = {
+        "headline": "No actionable order", "confidence": "low", "diagnosis": "Cash unavailable",
+        "decision_summary": "Keep positions unchanged", "cash_decision": {
+            "target_cash_pct": 10, "regime": "neutral", "rationale": "Cash is unknown",
+            "regime_signals": [], "deploy_conditions": [], "raise_conditions": []},
+        "trades": [], "priority_order": [], "swaps_considered": [],
+        "cash_plan": {"summary": "", "deployments": []}, "key_risks": [],
+        "levels": [], "what_would_change_my_mind": [], "data_gaps": [],
+    }
+    unknown_check = fm.validate_trades(unknown_decision, unknown_book_stats)
+    assert unknown_check["ending_cash"] is None and unknown_check["ending_cash_pct"] is None
+    unknown_report = fm.render_markdown(
+        "2026-11-06", {"fm": "test", "aggressive": "test", "conservative": "test", "neutral": "test"},
+        unknown_book_stats, {}, None, [], unknown_decision, [], None, unknown_check, None, {})
+    assert "Ending cash: **n/a (n/a%)**" in unknown_report
+    assert "whole-book weights, volatility, VaR and stress are unavailable" in unknown_report
+    failed_provider_report = fm.render_markdown(
+        "2026-11-06", {"fm": "test", "aggressive": "test", "conservative": "test", "neutral": "test"},
+        unknown_book_stats, {}, None, [], None, [], None, None, None, {}, no_llm=False)
+    assert "Fund manager response did not produce a schema-valid plan; this run is incomplete." in failed_provider_report
+    assert "LLM step skipped (--no-llm)" not in failed_provider_report
+
+    bad_quantity = fm.validate_trades(
+        {"trades": [{"ticker": "NVDA", "action": "BUY", "shares": "bad"}]}, _stats())
+    assert bad_quantity["trades"][0]["status"] == "rejected"
+    bad_quantity_lines = []
+    fm.render_plan_trades(bad_quantity_lines, {"priority_order": []}, bad_quantity, {})
+    bad_quantity_report = "\n".join(bad_quantity_lines)
+    assert "rejected" in bad_quantity_report and "bad" in bad_quantity_report
+    assert fm.fmt_quantity(float("nan")) == "n/a" and fm.fmt_quantity(float("inf")) == "n/a"
+    precise_shares = 1.234567890123
+    assert fm.fmt_quantity(precise_shares) == repr(precise_shares)
+    known_bad_stats = {**unknown_book_stats,
+                       "account": {**unknown_book_stats["account"], "cash": 10000, "total_value": 13190,
+                                   "cash_pct": 75.8, "whole_book_available": True},
+                       "accounts": [{**unknown_book_stats["accounts"][0], "cash": 10000,
+                                     "available_cash": 10000}],
+                       "trade_policy": fm.parse_trade_policy({})}
+    bad_plan = {**unknown_decision, "trades": [{"ticker": "NVDA", "action": "BUY", "shares": "bad"}]}
+    bad_check = fm.validate_trades(bad_plan, known_bad_stats)
+    bad_report = fm.render_markdown(
+        "2026-11-06", {"fm": "test", "aggressive": "test", "conservative": "test", "neutral": "test"},
+        known_bad_stats, {}, None, [], bad_plan, [], None, bad_check, None, {})
+    assert "rejected" in bad_report and "bad" in bad_report
+    malformed_draft = {**unknown_decision, "trades": [
+        {"ticker": "AAPL", "account_id": "sg", "action": "BUY", "shares": "bad"}]}
+    valid_final = {**unknown_decision, "headline": "Keep", "trades": [
+        {"ticker": "AAPL", "account_id": "sg", "action": "HOLD", "shares": 0}]}
+    plan_diff = fm.diff_plans(malformed_draft, valid_final)
+    assert plan_diff[0]["draft"] == "BUY invalid(bad)" and plan_diff[0]["final"] == "HOLD 0"
+    final_check = fm.validate_trades(valid_final, known_bad_stats)
+    full_bad_report = fm.render_markdown(
+        "2026-11-06", {"fm": "test", "aggressive": "test", "conservative": "test", "neutral": "test"},
+        known_bad_stats, {}, None, [], malformed_draft,
+        [{"round": 1, "role": "neutral", "model": "test", "parsed": {"cash_view": {}}}],
+        valid_final, bad_check, final_check, {})
+    assert "BUY invalid(bad)" in full_bad_report and "HOLD 0" in full_bad_report
+
+    nondefault_stats = {**known_bad_stats, "trade_policy": {
+        "fee_per_order_usd": 5.0, "min_buy_notional_usd": 2000.0,
+        "min_residual_notional_usd": 1500.0}}
+    nondefault_plan = {**unknown_decision, "trades": [{"ticker": "AAPL", "account_id": "sg",
+                                                       "action": "BUY", "shares": 7}]}
+    nondefault_check = fm.validate_trades(nondefault_plan, nondefault_stats)
+    assert nondefault_check["trade_policy"] == nondefault_stats["trade_policy"]
+    assert nondefault_check["trades"][0]["status"] == "accepted"
+    assert nondefault_check["trades"][0]["fee_usd"] == 5.0
+    nondefault_report = fm.render_markdown(
+        "2026-11-06", {"fm": "test", "aggressive": "test", "conservative": "test", "neutral": "test"},
+        nondefault_stats, {}, None, [], nondefault_plan, [], None, nondefault_check, None, {})
+    assert "Trade policy: $5.00 per order; $2,000.00 minimum buy; $1,500.00 residual guideline." in nondefault_report
 
     decision = {
         "cash_decision": {"target_cash_pct": 20},
@@ -168,11 +351,12 @@ def main() -> int:
             {"ticker": "SPY", "action": "HOLD", "shares": 0, "decision": "keep"},
         ],
     }
-    decision["trades"][1] = {"ticker": "AAPL", "action": "BUY", "shares": 1, "decision": "add"}
+    decision["trades"][1] = {"ticker": "AAPL", "action": "BUY", "shares": 5, "decision": "add"}
     check = fm.validate_trades(decision, _stats())
     text = " ".join(check["warnings"])
     assert "trade-size indicator" not in text, text
-    assert check["ending_cash"] == 10300.0, check["ending_cash"]
+    assert check["ending_cash"] == 9494.0, check["ending_cash"]
+    assert check["fees_usd"] == 6.0
     assert "advisory position-size indicator" not in text, text
     assert "AI look-through" not in text and "top 3" not in text, text
     assert "ATR fallback" in text, text  # NVDA and AAPL have no plan stop
@@ -186,24 +370,24 @@ def main() -> int:
     half_stats = _stats()
     half_stats["risk_policy"] = {**fm.RISK_POLICY, "ai_sleeve": half}
     half_ai = fm.validate_trades(decision, half_stats)["post_trade_risk"]["ai_lookthrough_pct"]
-    assert abs(half_ai - 58.2) < 0.15, half_ai
+    assert abs(half_ai - 58.6) < 0.15, half_ai
     assert "SPY_-10pct_beta_scaled" in risk["stress"]
     assert risk["stress"]["SPY_-10pct_beta_scaled"]["pnl_usd"] < 0
 
-    # A small affordable trade is valid; available cash remains a real constraint.
+    # A buy must meet the notional floor and leave room for the order fee.
     small_trade = fm.validate_trades({
         "cash_decision": {"target_cash_pct": 10},
         "levels": [],
-        "trades": [{"ticker": "AAPL", "action": "BUY", "shares": 1, "decision": "add"}],
+        "trades": [{"ticker": "AAPL", "action": "BUY", "shares": 5, "decision": "add"}],
     }, _stats())
-    assert small_trade["ending_cash"] == 9800.0, small_trade["ending_cash"]
-    assert "trade-size indicator" not in " ".join(small_trade["warnings"])
+    assert small_trade["ending_cash"] == 8997.0, small_trade["ending_cash"]
+    assert small_trade["fees_usd"] == 3
     overspend = fm.validate_trades({
         "cash_decision": {"target_cash_pct": 10},
         "levels": [],
         "trades": [{"ticker": "AAPL", "action": "BUY", "shares": 51, "decision": "add"}],
     }, _stats())
-    assert any("overspend cash by $200" in warning for warning in overspend["warnings"]), overspend["warnings"]
+    assert any("insufficient account cash" in warning for warning in overspend["warnings"]), overspend["warnings"]
     spy = next(a for a in check["post_trade"] if a["ticker"] == "SPY")
     assert spy["downside_source"] == "plan"
     nvda = next(a for a in check["post_trade"] if a["ticker"] == "NVDA")
@@ -369,13 +553,21 @@ def main() -> int:
     rendered_text = "\n".join(rendered)
     assert "Owner-approved target" in rendered_text and "25.0%" in rendered_text
     assert "EXAMPLE" not in rendered_text and "Target (guidance)" not in rendered_text
-    import pandas as pd
     idx = pd.bdate_range("2025-10-01", "2025-11-06")
     close = pd.DataFrame({"SPY": [100 + i for i in range(len(idx))]}, index=idx)
     quotes = fm.live_quotes(["SPY"], close, "2025-11-06")
     assert quotes["SPY"]["timing"] == "as_of", quotes
     assert quotes["SPY"]["price"] == close["SPY"].iloc[-1]
     assert "live" not in (quotes["SPY"]["source"] or "")
+    import types
+    as_of_today = datetime.now().strftime("%Y-%m-%d")
+    for invalid_price in (float("nan"), float("inf"), 0.0):
+        fake_yf = types.ModuleType("yfinance")
+        fake_yf.Ticker = lambda _ticker, price=invalid_price: types.SimpleNamespace(
+            fast_info={"last_price": price})
+        with patch.dict("sys.modules", {"yfinance": fake_yf}):
+            invalid_live = fm.live_quotes(["AAA"], pd.DataFrame(), as_of_today)
+        assert invalid_live["AAA"]["price"] is None, invalid_live
     print("check_offline: ok")
     print(f"  configured safeguard states {warn_check['sleeves']['status']}/{breach_check['sleeves']['status']}")
     print(f"  speaking {order_a} vs {order_b}")
