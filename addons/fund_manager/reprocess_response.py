@@ -17,8 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fund_manager as fm
 
 SCHEMAS = {
-    "fund_manager_draft": fm.DRAFT_SCHEMA,
-    "fund_manager_final": fm.FINAL_SCHEMA,
+    "fund_manager_draft": fm.LEGACY_DRAFT_SCHEMA,
+    "fund_manager_final": fm.LEGACY_FINAL_SCHEMA,
+    "fund_manager_draft_v2": fm.DRAFT_SCHEMA,
+    "fund_manager_final_v2": fm.FINAL_SCHEMA,
     "aggressive_risk_view": fm.ANALYST_SCHEMA,
     "conservative_risk_view": fm.ANALYST_SCHEMA,
     "neutral_risk_view": fm.ANALYST_SCHEMA,
@@ -116,7 +118,8 @@ def reprocess(report_path: Path, index: int) -> Path:
             parsed = fm.parse_structured_response(result["content"], schema)
             result["status"] = "schema_valid"
             result["parsed_candidate"] = parsed
-            if schema_name in ("fund_manager_draft", "fund_manager_final"):
+            if schema_name in ("fund_manager_draft", "fund_manager_final",
+                               "fund_manager_draft_v2", "fund_manager_final_v2"):
                 if journal_only or not isinstance(report.get("stats"), dict):
                     result["trade_validation_status"] = "not_run_missing_report_stats"
                 else:

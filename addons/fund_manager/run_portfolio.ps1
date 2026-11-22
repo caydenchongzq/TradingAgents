@@ -70,9 +70,14 @@ if (-not (Test-Path (Join-Path $DataDir "targets.json"))) {
 }
 if (-not (Test-Path (Join-Path $DataDir "watchlist.json"))) { Set-Content (Join-Path $DataDir "watchlist.json") "[]" }
 
-function Invoke-TaPython([string[]]$PyArgs) {
+function Invoke-TaPython([string[]]$PyArgs, [switch]$ResearchOnly) {
   $Addons = (Resolve-Path (Join-Path $AddonDir "..")).Path
+  $ResearchEnv = @()
+  if ($ResearchOnly) {
+    $ResearchEnv = @("-e", "ARGUS_RESEARCH_ONLY=1", "-e", "TRADINGAGENTS_MEMORY_LOG_PATH=/home/appuser/.tradingagents/research_only_memory.md")
+  }
   & docker compose run --rm -T -e "TZ=$NyTz" --entrypoint python `
+    @ResearchEnv `
     -v "${AddonDir}:/home/appuser/addon:ro" `
     -v "${Addons}:/home/appuser/addons:ro" `
     tradingagents @PyArgs
@@ -165,8 +170,8 @@ function Invoke-NativeRun([string[]]$list, [string]$kind) {
     $i++
     Test-WeeklyBudget "native"
     Write-Host "[$kind $i/$($list.Count)] TradingAgents $t ($AnalysisDate) [news: yfinance,alpha_vantage] ..." -ForegroundColor Cyan
-    Invoke-TaPython @("/home/appuser/addon/run_native.py", "--ticker", $t, "--date", $AnalysisDate, "--analysts", $Analysts,
-      "--portfolio", "/home/appuser/.tradingagents/my_book.json", "--save", "--no-show") | Out-Host
+    Invoke-TaPython -ResearchOnly @("/home/appuser/addon/run_native.py", "--research-only", "--ticker", $t, "--date", $AnalysisDate, "--analysts", $Analysts,
+      "--save", "--no-show", "--no-checkpoint") | Out-Host
     if ($LASTEXITCODE -ne 0) {
       Write-Warning "$t run exited with code $LASTEXITCODE"
       $failed += $t

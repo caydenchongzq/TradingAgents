@@ -1,56 +1,431 @@
 {
-  "pricing_note": "Rates for GPT-6.1 Sol, GPT-6 Luna, and Claude Opus 5.5 match OpenRouter usage on the 2026-11-06 fund-manager run. Newly listed models have no local rate estimate; the UI shows no estimate until pricing is verified.",
+  "schema_version": 2,
+  "source": "Bundled OpenRouter public catalog seed",
+  "pricing_note": "GPT-6.1 Sol, GPT-6 Luna, and Claude Opus 5.5 use rates observed in OpenRouter usage on 2026-11-06. GPT-6.2 Sol, GPT-6.2 Astra, and Gemini 4 Argon use public OpenRouter catalog rates observed on 2026-11-21. OpenRouter routed rates and non-token usage may differ.",
   "models": [
     {
       "id": "openai/gpt-6.1-sol",
-      "label": "GPT-6.1 Sol",
+      "label": "OpenAI: GPT-6.1 Sol",
+      "name": "OpenAI: GPT-6.1 Sol",
+      "description": "GPT-6.1 Sol is an OpenAI reasoning model for agentic coding and document-heavy work.",
+      "context_length": 1050000,
+      "input_modalities": [
+        "file",
+        "image",
+        "text"
+      ],
+      "supported_parameters": [
+        "include_reasoning",
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "structured_outputs",
+        "tool_choice",
+        "tools",
+        "verbosity"
+      ],
       "effort": true,
       "usd_per_mtok_in": 2.5,
-      "usd_per_mtok_out": 10
+      "usd_per_mtok_out": 10,
+      "publisher": "openai",
+      "max_output_tokens": 128000,
+      "output_modalities": [
+        "text"
+      ],
+      "price_source": "OpenRouter usage on 2026-11-06",
+      "pricing": {
+        "input_cache_read": "0.0000001",
+        "input_cache_write": "0.0000025"
+      }
     },
     {
       "id": "openai/gpt-6-luna",
-      "label": "GPT-6 Luna",
+      "label": "OpenAI: GPT-6 Luna",
+      "name": "OpenAI: GPT-6 Luna",
+      "description": "GPT-6 Luna is OpenAI’s fast, cost-efficient model for high-volume and latency-sensitive work.",
+      "context_length": 1050000,
+      "input_modalities": [
+        "file",
+        "image",
+        "text"
+      ],
+      "supported_parameters": [
+        "include_reasoning",
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "structured_outputs",
+        "tool_choice",
+        "tools",
+        "verbosity"
+      ],
       "effort": true,
       "usd_per_mtok_in": 0.125,
-      "usd_per_mtok_out": 0.5
+      "usd_per_mtok_out": 0.5,
+      "publisher": "openai",
+      "max_output_tokens": 128000,
+      "output_modalities": [
+        "text"
+      ],
+      "price_source": "OpenRouter usage on 2026-11-06",
+      "pricing": {
+        "input_cache_read": "0.00000001",
+        "input_cache_write": "0.000000125"
+      }
     },
     {
       "id": "anthropic/claude-opus-5.5",
-      "label": "Claude Opus 5.5",
+      "label": "Anthropic: Claude Opus 5.5",
+      "name": "Anthropic: Claude Opus 5.5",
+      "description": "Claude Opus 5.5 is Anthropic’s flagship model for demanding reasoning, coding, and long-horizon agent work.",
+      "context_length": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "file"
+      ],
+      "supported_parameters": [
+        "include_reasoning",
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "stop",
+        "structured_outputs",
+        "tool_choice",
+        "tools",
+        "verbosity"
+      ],
       "effort": true,
       "usd_per_mtok_in": 4,
-      "usd_per_mtok_out": 20
+      "usd_per_mtok_out": 20,
+      "publisher": "anthropic",
+      "max_output_tokens": 128000,
+      "output_modalities": [
+        "text"
+      ],
+      "price_source": "OpenRouter usage on 2026-11-06",
+      "pricing": {
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.000005"
+      }
     },
     {
       "id": "deepseek/deepseek-v4.1-flash-1017",
       "label": "DeepSeek V4.1 Flash 1017",
+      "name": "DeepSeek V4.1 Flash 1017",
+      "input_modalities": [
+        "text"
+      ],
+      "supported_parameters": [
+        "tools",
+        "tool_choice",
+        "json_schema"
+      ],
       "effort": true
     },
     {
       "id": "moonshotai/kimi-k3",
       "label": "Kimi K3",
+      "name": "Kimi K3",
+      "input_modalities": [
+        "text"
+      ],
+      "supported_parameters": [
+        "tools",
+        "tool_choice",
+        "json_schema"
+      ],
       "effort": true
     },
     {
       "id": "moonshotai/kimi-k3.1-pro",
       "label": "Kimi K3.1 Pro",
+      "name": "Kimi K3.1 Pro",
+      "input_modalities": [
+        "text"
+      ],
+      "supported_parameters": [
+        "tools",
+        "tool_choice",
+        "json_schema"
+      ],
       "effort": true
+    },
+    {
+      "id": "openai/gpt-6.2-sol",
+      "label": "OpenAI: GPT-6.2 Sol",
+      "name": "OpenAI: GPT-6.2 Sol",
+      "description": "GPT-6.2 Sol is OpenAI’s efficient, versatile reasoning model for everyday work.",
+      "context_length": 1050000,
+      "max_output_tokens": 128000,
+      "input_modalities": [
+        "file",
+        "image",
+        "text"
+      ],
+      "supported_parameters": [
+        "include_reasoning",
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "structured_outputs",
+        "tool_choice",
+        "tools",
+        "verbosity"
+      ],
+      "effort": true,
+      "usd_per_mtok_in": 2,
+      "usd_per_mtok_out": 10,
+      "price_tiers": [
+        {
+          "min_prompt_tokens": 272000,
+          "usd_per_mtok_in": 4,
+          "usd_per_mtok_out": 15
+        }
+      ],
+      "price_source": "OpenRouter public catalog",
+      "price_fetched_at": "2026-11-21",
+      "publisher": "openai",
+      "output_modalities": [
+        "text"
+      ],
+      "pricing": {
+        "input_cache_read": "0.0000001",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "min_prompt_tokens": 272000,
+            "prompt": "4e-06",
+            "completion": "1.5e-05",
+            "input_cache_read": "0.0000002",
+            "input_cache_write": "0.000005"
+          }
+        ]
+      }
+    },
+    {
+      "id": "openai/gpt-6.2-astra",
+      "label": "OpenAI: GPT-6.2 Astra",
+      "name": "OpenAI: GPT-6.2 Astra",
+      "description": "GPT-6.2 Astra is OpenAI’s flagship model for engineering, professional work, and scientific research.",
+      "context_length": 1050000,
+      "max_output_tokens": 128000,
+      "input_modalities": [
+        "file",
+        "image",
+        "text"
+      ],
+      "supported_parameters": [
+        "include_reasoning",
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "structured_outputs",
+        "tool_choice",
+        "tools",
+        "verbosity"
+      ],
+      "effort": true,
+      "usd_per_mtok_in": 8,
+      "usd_per_mtok_out": 40,
+      "price_tiers": [
+        {
+          "min_prompt_tokens": 272000,
+          "usd_per_mtok_in": 16,
+          "usd_per_mtok_out": 60
+        }
+      ],
+      "price_source": "OpenRouter public catalog",
+      "price_fetched_at": "2026-11-21",
+      "publisher": "openai",
+      "output_modalities": [
+        "text"
+      ],
+      "pricing": {
+        "input_cache_read": "0.0000004",
+        "input_cache_write": "0.00001",
+        "overrides": [
+          {
+            "min_prompt_tokens": 272000,
+            "prompt": "1.6e-05",
+            "completion": "6e-05",
+            "input_cache_read": "0.0000008",
+            "input_cache_write": "0.00002"
+          }
+        ]
+      }
     },
     {
       "id": "google/gemini-4-argon",
-      "label": "Gemini 4 Argon",
-      "effort": true
+      "label": "Google: Gemini 4 Argon",
+      "name": "Google: Gemini 4 Argon",
+      "description": "Gemini 4 Argon is Google’s multimodal reasoning model, available through OpenRouter.",
+      "context_length": 1048576,
+      "input_modalities": [
+        "audio",
+        "file",
+        "image",
+        "text",
+        "video"
+      ],
+      "supported_parameters": [
+        "include_reasoning",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "stop",
+        "structured_outputs",
+        "temperature",
+        "tool_choice",
+        "tools",
+        "top_p"
+      ],
+      "effort": true,
+      "usd_per_mtok_in": 2,
+      "usd_per_mtok_out": 10,
+      "price_source": "OpenRouter public catalog",
+      "price_fetched_at": "2026-11-21",
+      "publisher": "google",
+      "max_output_tokens": 943718,
+      "output_modalities": [
+        "text"
+      ],
+      "pricing": {
+        "prompt": "0.000002",
+        "completion": "0.00001",
+        "image": "0.000002",
+        "audio": "0.000002",
+        "web_search": "0.014",
+        "internal_reasoning": "0.00001",
+        "input_cache_read": "0.0000001",
+        "input_cache_write": "0.0000001875"
+      }
     },
     {
       "id": "openai/gpt-6.1-terra",
-      "label": "GPT-6.1 Terra",
-      "effort": true
+      "label": "OpenAI: GPT-6.1 Terra",
+      "effort": true,
+      "name": "OpenAI: GPT-6.1 Terra",
+      "publisher": "openai",
+      "description": "GPT-6.1 Terra is OpenAI’s mid-tier model for everyday agentic, coding, and writing work.",
+      "context_length": 1050000,
+      "max_output_tokens": 128000,
+      "input_modalities": [
+        "file",
+        "image",
+        "text"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "supported_parameters": [
+        "include_reasoning",
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "structured_outputs",
+        "tool_choice",
+        "tools",
+        "verbosity"
+      ],
+      "price_source": "OpenRouter public catalog",
+      "usd_per_mtok_in": 1,
+      "usd_per_mtok_out": 5,
+      "price_tiers": [
+        {
+          "min_prompt_tokens": 272000,
+          "usd_per_mtok_in": 2,
+          "usd_per_mtok_out": 7.5
+        }
+      ],
+      "pricing": {
+        "input_cache_read": "0.00000005",
+        "input_cache_write": "0.00000125",
+        "overrides": [
+          {
+            "min_prompt_tokens": 272000,
+            "prompt": "2e-06",
+            "completion": "7.5e-06",
+            "input_cache_read": "0.0000001",
+            "input_cache_write": "0.0000025"
+          }
+        ]
+      },
+      "price_fetched_at": "2026-11-21"
     },
     {
       "id": "openai/gpt-6-astra",
-      "label": "GPT-6 Astra",
-      "effort": true
+      "label": "OpenAI: GPT-6 Astra",
+      "effort": true,
+      "name": "OpenAI: GPT-6 Astra",
+      "publisher": "openai",
+      "description": "GPT-6 Astra is OpenAI’s flagship model for demanding analysis, engineering, research, and document work.",
+      "context_length": 1050000,
+      "max_output_tokens": 128000,
+      "input_modalities": [
+        "file",
+        "image",
+        "text"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "supported_parameters": [
+        "include_reasoning",
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "structured_outputs",
+        "tool_choice",
+        "tools",
+        "verbosity"
+      ],
+      "price_source": "OpenRouter public catalog",
+      "usd_per_mtok_in": 10,
+      "usd_per_mtok_out": 50,
+      "price_tiers": [
+        {
+          "min_prompt_tokens": 272000,
+          "usd_per_mtok_in": 20,
+          "usd_per_mtok_out": 75
+        }
+      ],
+      "pricing": {
+        "input_cache_read": "0.000001",
+        "input_cache_write": "0.0000125",
+        "overrides": [
+          {
+            "min_prompt_tokens": 272000,
+            "prompt": "2e-05",
+            "completion": "7.5e-05",
+            "input_cache_read": "0.000002",
+            "input_cache_write": "0.000025"
+          }
+        ]
+      },
+      "price_fetched_at": "2026-11-21"
     }
   ]
 }

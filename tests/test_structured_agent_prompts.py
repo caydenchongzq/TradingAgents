@@ -128,6 +128,9 @@ def test_sentiment_prompt_states_constraint(monkeypatch):
     assert NO_EXTERNAL_TOOLS in text
     # This agent binds no tools, so tool-range wording must not reappear.
     assert "tool-call date ranges" not in text
+    assert "Reddit RSS was retired" in text
+    assert "unavailable sources" in text.lower()
+    assert "not mean that source was silent or neutral" in text
 
 
 @pytest.mark.unit

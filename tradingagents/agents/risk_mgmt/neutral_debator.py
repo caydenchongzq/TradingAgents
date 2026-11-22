@@ -5,9 +5,10 @@ from tradingagents.agents.context import (
     opponent_argument_or_opening,
     report_or_absent,
 )
+from tradingagents.agents.structured import NO_EXTERNAL_TOOLS
 
 
-def create_neutral_debator(llm):
+def create_neutral_debator(llm, research_only: bool = False):
     def neutral_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state.get("history", "")
@@ -29,7 +30,23 @@ def create_neutral_debator(llm):
 
         trader_decision = state["trader_investment_plan"]
 
-        prompt = f"""As the Neutral Risk Analyst, your role is to provide a balanced perspective, weighing both the potential benefits and risks of the trader's decision or plan. You prioritize a well-rounded approach, evaluating the upsides and downsides while factoring in broader market trends, potential economic shifts, and diversification strategies.Here is the trader's decision:
+        if research_only:
+            prompt = f"""You are the instrument's neutral risk analyst. Reconcile the strongest upside and downside evidence, identify assumptions and uncertainty, and state what evidence would change the instrument outlook. You do not know the user's portfolio; do not recommend user-specific buying, selling, quantities, position sizes, cash fractions or standard allocations.
+
+Instrument context: {instrument_context}
+Market: {market_research_report}
+Sentiment (dated): {sentiment_report}
+News: {news_report}
+Fundamentals: {fundamentals_report}
+Instrument hypothesis: {trader_decision}
+Debate so far: {history}
+Aggressive view: {current_aggressive_response}
+Conservative view: {current_conservative_response}
+
+Provide an evidence-based instrument risk assessment. Discuss price levels only conditionally, not as orders.
+{NO_EXTERNAL_TOOLS}""" + get_language_instruction()
+        else:
+            prompt = f"""As the Neutral Risk Analyst, your role is to provide a balanced perspective, weighing both the potential benefits and risks of the trader's decision or plan. You prioritize a well-rounded approach, evaluating the upsides and downsides while factoring in broader market trends, potential economic shifts, and diversification strategies.Here is the trader's decision:
 
 {trader_decision}
 

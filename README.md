@@ -77,7 +77,7 @@ Our framework decomposes complex trading tasks into specialized roles.
 
 ### Analyst Team
 - Fundamentals Analyst: Evaluates company financials and performance metrics, identifying intrinsic values and potential red flags.
-- Sentiment Analyst: Aggregates news headlines, StockTwits, and Reddit chatter into a single sentiment read to gauge short-term market mood.
+- Sentiment Analyst: Aggregates available news headlines and StockTwits evidence into a sentiment read; Reddit is reported as unavailable after public RSS retirement.
 - News Analyst: Monitors global news and macroeconomic indicators, interpreting the impact of events on market conditions.
 - Technical Analyst: Utilizes technical indicators (like MACD and RSI) to detect trading patterns and forecast price movements.
 
@@ -189,7 +189,13 @@ For local models, configure Ollama with `llm_provider: "ollama"`. The default en
 
 For any other OpenAI-compatible server (vLLM, LM Studio, llama.cpp, or a custom relay), use `llm_provider: "openai_compatible"` and set the endpoint via `backend_url` (or `TRADINGAGENTS_LLM_BACKEND_URL`), e.g. `http://localhost:8000/v1` for vLLM or `http://localhost:1234/v1` for LM Studio. The model is whatever your server serves. No key is needed for local servers; set `OPENAI_COMPATIBLE_API_KEY` when the endpoint requires one.
 
-With `TYPESAFE_API_KEY` set, the Sentiment Analyst screens StockTwits and Reddit posts with TypeSafe's Jev before reading them. Posts that are not about the company are dropped, and each source opens with a count of the remaining posts by stance: bullish, bearish, neutral, or unclear. Without the key, posts pass through unscreened. `jev-latest` moves with new releases; set `TYPESAFE_DEFAULT_MODEL` to a versioned ID such as `jev-1.13.0` to hold it fixed across runs. To reach Jev through OpenRouter, put an OpenRouter key in `TYPESAFE_API_KEY` and set `TYPESAFE_BASE_URL=https://openrouter.ai/api`.
+With `TYPESAFE_API_KEY` set, the Sentiment Analyst screens available StockTwits and social posts with TypeSafe's Jev before reading them. Posts that are not about the company are dropped, and each source opens with a count of the remaining posts by stance: bullish, bearish, neutral, or unclear. Without the key, available posts pass through unscreened. `jev-latest` moves with new releases; set `TYPESAFE_DEFAULT_MODEL` to a versioned ID such as `jev-1.13.0` to hold it fixed across runs. To reach Jev through OpenRouter, put an OpenRouter key in `TYPESAFE_API_KEY` and set `TYPESAFE_BASE_URL=https://openrouter.ai/api`.
+
+### Sentiment source availability
+
+Reddit retired its public RSS feeds on November 13, 2026. The sentiment fetcher reports Reddit unavailable and makes no RSS requests. Reddit's API access changes do not establish that this external research use is eligible, so an account or OAuth credentials are not treated as a replacement. See [Reddit's RSS retirement notice](https://support.reddithelp.com/hc/en-us/articles/55472297340308-Changelog-November-10-2026) and [API access update](https://support.reddithelp.com/hc/en-us/articles/54353370049684-Changelog-October-8-2026).
+
+StockTwits remains on its unauthenticated public symbol-stream path. A 403 is reported as access denied without assuming a missing key. New app registration is currently closed, and supported Enterprise API access is offered through provider arrangements. An unauthenticated request succeeded during a bounded check on November 21, 2026, so a past 403 does not prove the endpoint is universally unavailable. See [StockTwits developer registration](https://api.stocktwits.com/developers) and [API access plans](https://help.stocktwits.com/c/stocktwits-edge/stocktwits-edge/plans-compared). The analyst identifies unavailable sources separately from successful empty results. If all three inputs are unavailable, it returns an explicit unavailable report without a fabricated sentiment score.
 
 Alternatively, copy `.env.example` to `.env` and fill in your keys:
 ```bash
@@ -291,6 +297,8 @@ config["deep_think_llm"] = "claude-opus-5-5"
 
 A tier on its own provider uses that provider's key and default endpoint; set `quick_think_backend_url` or `deep_think_backend_url` for a local or relay endpoint. The `TRADINGAGENTS_DEEP_THINK_PROVIDER` and `TRADINGAGENTS_QUICK_THINK_PROVIDER` variables set them for the CLI, together with the tier's model variable.
 
+Argus reads the OpenRouter model catalog from `addons/openrouter_models.json` as its offline seed and stores successful refreshes in `data/openrouter_models_cache.json`. `ARGUS_MODELS_CONFIG` selects a custom catalog path. Public catalog rates are listed in USD per million tokens and are inventory estimates. Long-context tiers are applied per call when prompt-token counts are available. Cache, tool, routed-provider and other usage charges may differ, and provider-reported usage costs remain authoritative. Missing rates stay unknown, while a published zero rate remains a valid value.
+
 See `tradingagents/default_config.py` for all configuration options.
 
 ### Fundamentals as filed
@@ -384,7 +392,7 @@ TradingAgents is LLM-driven, so two runs of the same ticker and date can differ.
 
 Language model sampling is non-deterministic. Even at a fixed temperature, providers do not guarantee byte-identical output across calls, and reasoning models (the default GPT-6 family, and any thinking-mode model) vary the most because their internal reasoning is itself sampled.
 
-Live data moves. News, StockTwits, and Reddit return different content as time passes, so a run today sees different inputs than a run last week even for the same historical trade date. Pin the analysis date to hold the price and indicator window fixed, but the social and news sources still reflect "now".
+Live data moves. News and StockTwits can return different content as time passes, so a run today may see different inputs than a run last week even for the same historical trade date. Pin the analysis date to hold the price and indicator window fixed, but current news and social sources still reflect "now". Reddit is currently unavailable after public RSS retirement.
 
 To reduce variation you can lower the sampling temperature. Set `temperature` in your config (or `TRADINGAGENTS_TEMPERATURE` in `.env`); lower values make models that honor it more repeatable. The current curated models are reasoning-first and largely ignore temperature, so for tighter reproducibility name a non-reasoning model in your config, or in `TRADINGAGENTS_DEEP_THINK_LLM` and `TRADINGAGENTS_QUICK_THINK_LLM`. Any model ID your provider serves is accepted, whether or not the picker lists it.
 

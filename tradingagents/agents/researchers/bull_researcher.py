@@ -6,7 +6,7 @@ from tradingagents.agents.context import (
 )
 
 
-def create_bull_researcher(llm):
+def create_bull_researcher(llm, research_only: bool = False):
     def bull_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
@@ -28,7 +28,12 @@ def create_bull_researcher(llm):
             else "Asset fundamentals report (may be unavailable for crypto)"
         )
 
-        prompt = f"""You are a Bull Analyst advocating for investing in the {target_label}. Your task is to build a strong, evidence-based case emphasizing growth potential, competitive advantages, and positive market indicators. Leverage the provided research and data to address concerns and counter bearish arguments effectively.
+        profile_guidance = (
+            "Make an instrument-level case only. You do not know the user's holdings, cash, or portfolio; do not recommend transaction sizes, order timing, or allocation."
+            if research_only
+            else ""
+        )
+        prompt = f"""You are a Bull Analyst advocating for investing in the {target_label}. Your task is to build a strong, evidence-based case emphasizing growth potential, competitive advantages, and positive market indicators. Leverage the provided research and data to address concerns and counter bearish arguments effectively. {profile_guidance}
 
 Key points to focus on:
 - Growth Potential: Highlight the company's market opportunities, revenue projections, and scalability.

@@ -16,16 +16,23 @@ from tradingagents.agents.context import (
     get_portfolio_context_from_state,
 )
 from tradingagents.agents.rating import parse_rating
-from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
+from tradingagents.agents.schemas import (
+    InstrumentResearchBrief,
+    PortfolioDecision,
+    render_instrument_research_brief,
+    render_pm_decision,
+)
 from tradingagents.agents.structured import NO_EXTERNAL_TOOLS, bind_structured, invoke_structured
 
 
-def create_portfolio_manager(llm):
-    structured_llm = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
+def create_portfolio_manager(llm, research_only: bool = False):
+    schema = InstrumentResearchBrief if research_only else PortfolioDecision
+    renderer = render_instrument_research_brief if research_only else render_pm_decision
+    structured_llm = bind_structured(llm, schema, "Portfolio Manager")
 
     def portfolio_manager_node(state) -> dict:
         instrument_context = get_instrument_context_from_state(state)
-        portfolio_context = get_portfolio_context_from_state(state)
+        portfolio_context = "" if research_only else get_portfolio_context_from_state(state)
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -39,7 +46,22 @@ def create_portfolio_manager(llm):
             else ""
         )
 
-        prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
+        if research_only:
+            prompt = f"""You are the final instrument research synthesizer, not an allocator. You have no user holdings, cash, cost basis or portfolio. Do not recommend buying, selling, holding a user's position, share quantities, order timing, cash use, allocation percentages or standard allocations.
+
+{instrument_context}
+
+Synthesize the research manager's instrument thesis, the trader's hypothesis and the three instrument risk views below. Preserve disagreements and uncertainty. Provide a justified company valuation target or range only if the evidence supports it; otherwise leave the value unknown and explain why. State a thesis horizon only when supported. A thesis horizon describes the expected evidence window, not a user's holding period.
+
+Research plan: {research_plan}
+Instrument hypothesis: {trader_plan}
+Risk debate:
+{history}
+
+Return the structured instrument research brief. Include thesis/counter-thesis, valuation method and assumptions, dated sentiment, catalysts, risks, conditional instrument levels, confidence, unknowns and source dates. Numeric financial facts and conditional price levels are instrument research, not portfolio sizing.
+{NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
+        else:
+            prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
 
 {instrument_context}
 
@@ -79,11 +101,11 @@ Write these sections, in this order, starting with the rating on its own line:
         # Read back from text, a rating the thesis quotes could replace it.
         decision = invoke_structured(structured_llm, prompt, "Portfolio Manager")
         if decision is not None:
-            final_trade_decision = render_pm_decision(decision)
-            final_rating = decision.rating.value
+            final_trade_decision = renderer(decision)
+            final_rating = "RESEARCH" if research_only else decision.rating.value
         else:
             final_trade_decision = llm.invoke(prompt).content
-            final_rating = parse_rating(final_trade_decision)
+            final_rating = "REVIEW" if research_only else parse_rating(final_trade_decision)
 
         new_risk_debate_state = {
             "history": risk_debate_state["history"],
@@ -97,10 +119,13 @@ Write these sections, in this order, starting with the rating on its own line:
             "count": risk_debate_state["count"],
         }
 
-        return {
+        result = {
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": final_trade_decision,
             "final_rating": final_rating,
         }
+        if research_only and decision is not None:
+            result["research_brief"] = decision.model_dump(mode="json")
+        return result
 
     return portfolio_manager_node

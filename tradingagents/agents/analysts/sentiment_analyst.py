@@ -5,7 +5,7 @@ prompt, so the model reports on data it was given rather than inventing posts:
 
   1. News headlines: Yahoo Finance
   2. StockTwits messages: the cashtag stream, with Bullish/Bearish tags
-  3. Reddit posts: r/wallstreetbets, r/stocks, r/investing, or crypto communities for a crypto pair
+  3. Reddit source status: unavailable after public RSS retirement
 
 Each source is trimmed to the analysis window. With a TypeSafe key, the social
 posts are screened by Jev first (see post_screen). These feeds serve recent items
@@ -44,7 +44,36 @@ def _seven_days_back(trade_date: str) -> str:
     return (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
 
 
-def create_sentiment_analyst(llm):
+def _source_unavailable(block: str) -> bool:
+    """Match the fetchers' explicit unavailable markers at the block boundary."""
+    normalized = block.lstrip().lower()
+    return normalized.startswith((
+        "data_unavailable:",
+        "<yahoo finance news unavailable",
+        "<stocktwits unavailable",
+        "<reddit unavailable:",
+    ))
+
+
+def _unavailable_summary(news_block: str, stocktwits_block: str, reddit_block: str) -> str:
+    """Give stable source reasons without surfacing raw provider exceptions."""
+    reasons = []
+    if _source_unavailable(news_block):
+        reasons.append("News data was unavailable")
+    if _source_unavailable(stocktwits_block):
+        marker = stocktwits_block.lstrip().lower()
+        if marker.startswith("<stocktwits unavailable: access denied"):
+            reasons.append("StockTwits access was denied")
+        elif marker.startswith("<stocktwits unavailable: timeout"):
+            reasons.append("StockTwits request timed out")
+        else:
+            reasons.append("StockTwits data was unavailable")
+    if _source_unavailable(reddit_block):
+        reasons.append("Reddit public RSS is retired and no supported access path is configured")
+    return "; ".join(reasons)
+
+
+def create_sentiment_analyst(llm, research_only: bool = False):
     """Create a sentiment analyst node for the trading graph.
 
     Pre-fetches news + StockTwits + Reddit data, injects them into the
@@ -75,6 +104,20 @@ def create_sentiment_analyst(llm):
             ticker, subreddits, start_date=start_date, end_date=end_date, screen=screen
         )
 
+        if all(_source_unavailable(block) for block in (
+            news_block, stocktwits_block, reddit_block
+        )):
+            report_text = (
+                f"**Sentiment unavailable for {ticker}**\n\n"
+                f"{_unavailable_summary(news_block, stocktwits_block, reddit_block)} "
+                "for this analysis window. No sentiment direction, score, or "
+                "confidence measurement was produced."
+            )
+            return {
+                "messages": [AIMessage(content=report_text)],
+                "sentiment_report": report_text,
+            }
+
         system_message = _build_system_message(
             ticker=ticker,
             start_date=start_date,
@@ -83,6 +126,7 @@ def create_sentiment_analyst(llm):
             stocktwits_block=stocktwits_block,
             reddit_block=reddit_block,
             subreddits=subreddits,
+            research_only=research_only,
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -136,6 +180,7 @@ def _build_system_message(
     stocktwits_block: str,
     reddit_block: str,
     subreddits: tuple[str, ...] = DEFAULT_SUBREDDITS,
+    research_only: bool = False,
 ) -> str:
     """Assemble the sentiment-analyst system message with structured data blocks."""
     if subreddits == DEFAULT_SUBREDDITS:
@@ -144,7 +189,7 @@ def _build_system_message(
         character = f"r/{subreddits[0]} leans toward the coin's holders; r/CryptoCurrency and r/CryptoMarkets are broader"
     else:
         character = "r/CryptoCurrency and r/CryptoMarkets are broad crypto communities"
-    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on three complementary data sources that have already been collected for you.
+    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}. The three source fetches have been attempted. Analyze available evidence and distinguish unavailable sources from successful empty results.
 
 ## Data sources (pre-fetched, in this prompt)
 
@@ -162,8 +207,8 @@ Fast-moving signal. Each message carries a user-labeled sentiment tag (Bullish /
 {stocktwits_block}
 <end_of_stocktwits>
 
-### Reddit posts — {", ".join(f"r/{sub}" for sub in subreddits)} (past 7 days)
-Community discussion, without vote or comment counts. Subreddit character matters ({character}).
+### Reddit source — {", ".join(f"r/{sub}" for sub in subreddits)}
+Public Reddit RSS was retired. The current fetcher reports this source unavailable and does not retrieve posts. Subreddit descriptions ({character}) are historical context only.
 
 <start_of_reddit>
 {reddit_block}
@@ -175,17 +220,21 @@ Community discussion, without vote or comment counts. Subreddit character matter
 
 2. **Look for cross-source divergences.** If news framing is bearish but StockTwits is overwhelmingly bullish, that mismatch is itself a signal — it can mean retail is leaning into a thesis the news flow hasn't caught up to (or vice versa, that retail is chasing while institutions are cautious).
 
-3. **Read Reddit posts for substance.** The feed carries no vote or comment counts, so judge a post by its body excerpt, not its title alone, and do not infer engagement.
+3. **Treat Reddit as unavailable.** Public RSS was retired, so no Reddit posts were collected. Do not infer discussion or silence from this source.
 
 4. **Distinguish opinion from event.** A news headline ("Nvidia announces $500M Corning deal") is an event; a StockTwits post ("buying NVDA, this is going to moon") is opinion. Both are inputs but should be weighted differently in your conclusions.
 
 5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
 
-6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If the sources are silent on a given subreddit, say so.
+6. **Be honest about data limits.** An "<unavailable>" marker means the source did not provide evidence. It does not mean that source was silent or neutral. Reddit is currently unavailable because public RSS was retired. Flag unavailable sources in the narrative and lower confidence when coverage is limited. A successful empty result means the source returned no matching items and may be described as empty only when the returned block says so.
 
 7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
 
 8. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call.
+
+## Interpretation profile
+
+{("Assess dated sentiment evidence about the instrument and its catalysts or risks. Do not recommend user-specific transactions, quantities, or portfolio allocations." if research_only else "Explain how sentiment may inform the trading decision.")}
 
 ## Output fields
 

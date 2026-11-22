@@ -14,11 +14,11 @@ import os
 import re
 import sys
 from pathlib import Path
+import model_inventory
 
 LOCKED_MODEL = "anthropic/claude-opus-5.5"
 CONSERVATIVE_SEATS = ("risk_conservative", "fm_conservative")
 EFFORTS = ("low", "medium", "high")
-_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\-/]{0,119}$")
 _MAX_PROMPT = 60000
 
 # Token totals from fund-manager run 2026-11-06 172558_251bfd (one debate round).
@@ -61,10 +61,7 @@ def config_path() -> Path:
 
 
 def models_path() -> Path:
-    env = os.getenv("ARGUS_MODELS_CONFIG")
-    if env:
-        return Path(env)
-    return addons_dir() / "openrouter_models.json"
+    return model_inventory.models_path()
 
 
 def ta_root() -> Path:
@@ -301,13 +298,10 @@ def catalog() -> dict[str, dict]:
 
 
 def load_models() -> dict:
-    path = models_path()
-    if not path.is_file():
-        return {"models": [], "pricing_note": ""}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise AgentConfigError("openrouter_models.json must be an object")
-    return data
+    try:
+        return model_inventory.load_snapshot(models_path())
+    except model_inventory.InventoryError as exc:
+        raise AgentConfigError(str(exc)) from exc
 
 
 def load_overrides() -> dict:
@@ -335,8 +329,11 @@ def estimate_cost(seat: dict, model_row: dict | None) -> float | None:
     out = seat.get("est_output_tokens")
     if model_row is None or inn is None or out is None:
         return None
-    pin = model_row.get("usd_per_mtok_in")
-    pout = model_row.get("usd_per_mtok_out")
+    if seat.get("id") == "fm_manager" and model_row.get("price_tiers"):
+        # The stored sample combines two calls. A single aggregate prompt count
+        # cannot show which tier each draft/final call used.
+        return None
+    pin, pout = model_inventory.token_rates(model_row, inn)
     if not isinstance(pin, (int, float)) or not isinstance(pout, (int, float)):
         return None
     return round(float(inn) / 1_000_000 * float(pin) + float(out) / 1_000_000 * float(pout), 4)
@@ -348,7 +345,7 @@ def opus_warning(model: str, seat_id: str) -> str | None:
     return f"{seat_id} uses {model}. Opus on this seat is allowed and is not blocked."
 
 
-def resolved_seat(seat_id: str) -> dict:
+def resolved_seat(seat_id: str, models_snapshot: dict | None = None) -> dict:
     base = catalog().get(seat_id)
     if base is None:
         raise AgentConfigError(f"Unknown seat: {seat_id}")
@@ -366,11 +363,36 @@ def resolved_seat(seat_id: str) -> dict:
     seat["default_max_tokens"] = base["max_tokens"]
     seat["unlocked"] = False
     seat["locked"] = False
-    models = load_models().get("models") or []
+    models = (models_snapshot if models_snapshot is not None else load_models()).get("models") or []
     seat["opus_warning"] = opus_warning(str(seat.get("model") or ""), seat_id)
     seat["est_cost_usd"] = estimate_cost(seat, _model_row(str(seat.get("model") or ""), models))
+    if seat_id == "fm_manager" and model_row_has_tiers(models, str(seat.get("model") or "")):
+        seat["est_cost_note"] = (
+            "No estimate because the saved token sample combines draft and final calls, "
+            "so their pricing tiers cannot be determined separately."
+        )
+    else:
+        seat["est_cost_note"] = (
+            "Estimated from saved token-use samples and OpenRouter catalog rates. A routed call may cost differently."
+            if seat["est_cost_usd"] is not None else
+            "No estimate because model rates or token usage are incomplete."
+        )
+        if seat_id == "fm_manager" and seat["est_cost_usd"] is not None:
+            seat["est_cost_note"] += " Token sample includes the draft and final calls."
+    if model_row_has_conditional_pricing(models, str(seat.get("model") or "")):
+        seat["est_cost_note"] += " OpenRouter lists additional time-based price conditions; the estimate uses base rates."
     seat["customized"] = _is_custom(base, seat)
     return seat
+
+
+def model_row_has_tiers(models: list[dict], model_id: str) -> bool:
+    row = _model_row(model_id, models)
+    return bool(row and row.get("price_tiers"))
+
+
+def model_row_has_conditional_pricing(models: list[dict], model_id: str) -> bool:
+    row = _model_row(model_id, models)
+    return bool(row and row.get("has_conditional_pricing"))
 
 
 def _is_custom(base: dict, seat: dict) -> bool:
@@ -380,25 +402,28 @@ def _is_custom(base: dict, seat: dict) -> bool:
     return False
 
 
-def resolved_seats() -> list[dict]:
-    return [resolved_seat(row["id"]) for row in _seat_defs()]
+def resolved_seats(models_snapshot: dict | None = None) -> list[dict]:
+    models_snapshot = models_snapshot if models_snapshot is not None else load_models()
+    return [resolved_seat(row["id"], models_snapshot) for row in _seat_defs()]
 
 
-def public_payload() -> dict:
-    models = load_models()
+def public_payload(snapshot: dict | None = None) -> dict:
+    models = snapshot if snapshot is not None else load_models()
     seats = []
-    for seat in resolved_seats():
+    for seat in (resolved_seat(row["id"], models) for row in _seat_defs()):
         seats.append({k: seat.get(k) for k in (
             "id", "label", "group", "pipeline", "model", "effort", "temperature", "max_tokens",
             "system", "default_system", "default_model", "default_effort", "default_max_tokens",
             "supports_effort", "supports_temperature", "supports_max_tokens",
             "locked", "unlocked", "opus_warning", "est_cost_usd", "est_input_tokens",
-            "est_output_tokens", "customized", "tier",
+            "est_output_tokens", "est_cost_note", "customized", "tier",
         )})
     warnings = [s["opus_warning"] for s in seats if s.get("opus_warning")]
     return {
-        "models": models.get("models") or [],
+        "models": [{**row, "compatible_seats": model_inventory.compatible_seats(row)}
+                   for row in models.get("models") or []],
         "pricing_note": models.get("pricing_note") or "",
+        "inventory": {key: models.get(key) for key in ("source", "fetched_at", "stale", "unavailable")},
         "locked_model": None,
         "lock_note": "",
         "seats": seats,
@@ -411,7 +436,7 @@ def _clean_model(value: str) -> str:
     model = str(value or "").strip()
     if "://" in model or model.startswith("//") or "\\" in model or ".." in model:
         raise AgentConfigError(f"Model id cannot be a URL or path: {model!r}")
-    if not _MODEL_RE.fullmatch(model):
+    if model_inventory.validate_assignment_id(model) != model:
         raise AgentConfigError(f"Invalid model id: {model!r}")
     return model
 
@@ -519,6 +544,11 @@ def validate_and_save(incoming: dict) -> dict:
 
 def apply_system_prompt(seat_id: str, text: str) -> str:
     """Swap a customized role into a prompt. An unchanged role is left alone."""
+    # Research-only stock runs still use configured seats/models, but the saved
+    # custom role text may contain user-specific sizing or portfolio context.
+    # Keep the native research profile's prompt contract authoritative there.
+    if os.getenv("ARGUS_RESEARCH_ONLY") == "1" and (seat_id in _NATIVE_FACTORIES or seat_id == "memory"):
+        return text
     seat = resolved_seat(seat_id)
     custom = str(seat.get("system") or "").strip()
     default = str(seat.get("default_system") or "").strip()
@@ -726,7 +756,7 @@ def _build_client(seat: dict, config: dict):
 
 
 def _wrap_factory(seat_id: str, original, config: dict):
-    def wrapped(llm, _orig=original, _seat=seat_id, _config=config):
+    def wrapped(llm, *factory_args, _orig=original, _seat=seat_id, _config=config, **factory_kwargs):
         seat = resolved_seat(_seat)
         name = _fallback_model_name(llm)
         try:
@@ -734,7 +764,7 @@ def _wrap_factory(seat_id: str, original, config: dict):
         except Exception as exc:  # noqa: BLE001
             print(f"[agent_config] {_seat}: keeping the tier client ({exc})", flush=True)
             inner = llm
-        return _orig(_SeatCall(_seat, inner))
+        return _orig(_SeatCall(_seat, inner), *factory_args, **factory_kwargs)
 
     return wrapped
 

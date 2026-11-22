@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -47,9 +48,6 @@ def main() -> int:
         "deepseek/deepseek-v4.1-flash-1017",
         "moonshotai/kimi-k3",
         "moonshotai/kimi-k3.1-pro",
-        "google/gemini-4-argon",
-        "openai/gpt-6.1-terra",
-        "openai/gpt-6-astra",
     }
     model_ids = {row["id"] for row in rows}
     assert newly_listed <= model_ids
@@ -59,11 +57,20 @@ def main() -> int:
     assert cl.price_tokens("openai/gpt-6.1-sol", 1_000_000, 0, rows) == 2.5
     assert cl.price_tokens("openai/gpt-6-luna", 1_000_000, 1_000_000, rows) == 0.625
     assert cl.price_tokens("anthropic/claude-opus-5.5", 1_000_000, 1_000_000, rows) == 24.0
+    assert cl.price_tokens("openai/gpt-6.1-terra", 1_000_000, 1_000_000, rows) == 9.5
+    assert cl.price_tokens("openai/gpt-6.1-terra", 100_000, 1_000_000, rows) == 5.1
+    assert cl.price_tokens("openai/gpt-6-astra", 1_000_000, 1_000_000, rows) == 95.0
+    assert cl.price_tokens("openai/gpt-6.2-sol", 271_999, 1_000_000, rows) == 10.543998
+    assert cl.price_tokens("openai/gpt-6.2-sol", 272_000, 1_000_000, rows) == 16.088
+    assert cl.price_tokens("openai/gpt-6.2-astra", 272_000, 1_000_000, rows) == 64.352
     provider = cl.price_call("openai/gpt-6.1-sol", 100, 100, 0.01, rows)
     assert provider["cost_usd"] == 0.01 and provider["cost_source"] == "provider"
     table = cl.cost_from_usage("openai/gpt-6.1-sol", {"prompt_tokens": 2_000_000, "completion_tokens": 0}, rows)
     assert table["cost_usd"] == 5.0 and table["cost_source"] == "price_table"
     assert cl.price_tokens("missing/model", 100, 100, rows) is None
+    assert cl.match_model("openai/gpt-6.2-sol-extra", rows) is None
+    assert cl.price_tokens("free/model", 1_000_000, 1_000_000,
+                           [{"id": "free/model", "usd_per_mtok_in": 0, "usd_per_mtok_out": 0}]) == 0
 
     # Model-call labels contain slashes; filenames must stay in the ledger folder,
     # while JSON retains the original label and weekly accounting sees each call once.
@@ -209,5 +216,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    check_disabled_weekly_budget()
-    sys.exit(main())
+    with patch.dict(os.environ, {
+        "ARGUS_MODELS_CONFIG": str(Path(__file__).with_name("openrouter_models.json").resolve()),
+    }):
+        check_disabled_weekly_budget()
+        sys.exit(main())

@@ -24,6 +24,10 @@ import numpy as np
 import pandas as pd
 
 DATA_ROOT = Path(os.getenv("FM_DATA_ROOT", "/home/appuser/.tradingagents"))
+ADDONS_ROOT = Path(__file__).resolve().parents[1]
+if str(ADDONS_ROOT) not in sys.path:
+    sys.path.insert(0, str(ADDONS_ROOT))
+from portfolio_book import PortfolioBookError, normalize_book
 DEEP_MODEL = os.getenv("THEME_SCOUT_MODEL", "openai/gpt-6.1-sol")
 OPENROUTER_BASE = os.getenv("FUND_MANAGER_BASE_URL", "https://openrouter.ai/api/v1")
 MIN_WATCH = 0  # retained for old callers; no watchlist floor is enforced
@@ -131,8 +135,6 @@ def load_watchlist(path: Path) -> list[dict]:
         row = {"ticker": tk, "sector": item.get("sector"), "type": item.get("type") or "stock"}
         if item.get("theme"):
             row["theme"] = item.get("theme")
-        if item.get("sub_theme"):
-            row["sub_theme"] = item.get("sub_theme")
         if item.get("note"):
             row["note"] = item.get("note")
         out.append(row)
@@ -147,7 +149,7 @@ def watchlist_version(items: list[dict]) -> str:
         if not ticker:
             continue
         row = {"ticker": ticker, "sector": item.get("sector"), "type": item.get("type") or "stock"}
-        for key in ("theme", "sub_theme", "note"):
+        for key in ("theme", "note"):
             if item.get(key):
                 row[key] = item[key]
         rows.append(row)
@@ -536,7 +538,10 @@ def book_ai_lookthrough(book: dict | None, close: pd.DataFrame, targets: dict | 
     A held name with no tag counts 0 here, as in the fund manager. Only new adds default to 1.0.
     """
     positions = (book or {}).get("positions") or []
-    cash = float((book or {}).get("cash") or 0)
+    raw_cash = (book or {}).get("cash")
+    if not isinstance(raw_cash, (int, float)) or isinstance(raw_cash, bool) or not math.isfinite(raw_cash):
+        return None
+    cash = float(raw_cash)
     sleeve = (targets or {}).get("ai_sleeve") or {}
     tick = sleeve.get("ticker_weight") or {}
     theme_w = sleeve.get("theme_weight") or {}
@@ -552,7 +557,12 @@ def book_ai_lookthrough(book: dict | None, close: pd.DataFrame, targets: dict | 
             if len(series):
                 px = float(series.iloc[-1])
         if px is None:
-            px = float(pos.get("average_price") or 0)
+            average = pos.get("average_price")
+            if not isinstance(average, (int, float)) or isinstance(average, bool) or not math.isfinite(average):
+                return None
+            px = float(average)
+        if px <= 0 or not math.isfinite(px):
+            return None
         value = qty * px
         invested += value
         if tk in tick:
@@ -625,8 +635,6 @@ def apply_watchlist(items: list[dict], adds: list[dict], drops: list[dict],
         # from the separately approved monitoring list.
         row = {"ticker": tk, "sector": add.get("sector") or "Unclassified", "type": add.get("type") or "stock",
                "ai_weight": weight, "ai_weight_source": source}
-        if add.get("sub_theme"):
-            row["sub_theme"] = add["sub_theme"]
         if add.get("reason"):
             row["note"] = add["reason"]
         by[tk] = row
@@ -803,7 +811,7 @@ def render_report_md(payload: dict) -> str:
 
 
 SCOUT_SYSTEM = """You are the theme scout for a concentrated US equity book. You see macro prints, a week of headlines,
-relative strength of sectors and AI sub-themes versus SPY, upcoming earnings, and a quant screen of every
+relative strength of sectors versus SPY, upcoming earnings, and a quant screen of every
 holding and every watchlist name.
 Rank the WHOLE list in `names`. Rank 1 is the strongest name for this book right now. A strong holding ranks
 ahead of a weak one. Put every shown ticker in `ranking` exactly once, with ranks 1 through N and no gaps.
@@ -862,9 +870,9 @@ def call_scout(model: str, context: str, system: str | None = None, max_tokens: 
                 "reason": {"type": "string"},
             }, "required": ["id", "stance", "reason"]}},
             "add": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {
-                "ticker": {"type": "string"}, "sub_theme": {"type": "string"},
+                "ticker": {"type": "string"},
                 "sector": {"type": "string"}, "reason": {"type": "string"},
-            }, "required": ["ticker", "sub_theme", "sector", "reason"]}},
+            }, "required": ["ticker", "sector", "reason"]}},
             "drop": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {
                 "ticker": {"type": "string"}, "reason": {"type": "string"},
             }, "required": ["ticker", "reason"]}},
@@ -1052,8 +1060,7 @@ def compact_scout_headlines(headlines: list[dict], per_source: int = 4) -> tuple
 
 
 def scout_model_context(date_text: str, macro: dict, headlines: list[dict], strength: list[dict],
-                       sectors: list[str], names: list[dict], ranked: list[dict],
-                       subthemes: list[str]) -> str:
+                       sectors: list[str], names: list[dict], ranked: list[dict]) -> str:
     """Compact duplicate screen data while retaining every holding and candidate."""
     evidence = {row.get("ticker"): row for row in model_screen_evidence(ranked)}
     model_names = [{**name, "evidence": evidence.get(name["ticker"], {})} for name in names]
@@ -1066,7 +1073,6 @@ def scout_model_context(date_text: str, macro: dict, headlines: list[dict], stre
         "relative_strength": strength,
         "discovery_sectors": sectors,
         "names": model_names,
-        "subthemes": subthemes,
         "ranking_count": len(model_names),
         "instructions": "Rank every name exactly once. Keep reasons concise. Missing evidence is unknown, not zero.",
     }, separators=(",", ":"), ensure_ascii=False, default=str)
@@ -1110,13 +1116,16 @@ def main() -> int:
     no_llm = args.no_llm or args.dry_run or args.screen
 
     root = Path(args.data_root)
-    book = load_json(root / "my_book.json", {"positions": []}) or {"positions": []}
+    try:
+        book = normalize_book(load_json(root / "my_book.json", {"positions": []}) or {"positions": []})
+    except PortfolioBookError as exc:
+        log(f"invalid portfolio book: {exc}")
+        return 2
     holdings = [str(p["ticker"]).upper() for p in book.get("positions") or []]
     watch_path = root / "watchlist.json"
     watch = load_watchlist(watch_path)
     themes_file = _themes_path(args.themes)
     themes = load_json(themes_file, {}) if themes_file else {}
-    subthemes = (themes or {}).get("subthemes") or {}
 
     discovered = discover_sector_candidates(args.sectors)
     discovered_by = {row["ticker"]: row for row in discovered}
@@ -1143,7 +1152,6 @@ def main() -> int:
                              "discovery_source": "selected sector ETF"}
                             for ticker in args.sectors if ticker in screened_tickers]
     groups = {"sector_" + s: [s] for s in args.sectors}
-    groups.update(subthemes)
     strength = group_rs(close, groups, "SPY")
     tier = tier_candidates(holdings, ranked, args.tier_n)
 
@@ -1186,7 +1194,7 @@ def main() -> int:
         held_set = set(holdings)
         names = [{"ticker": tk, "bucket": "holding"} for tk in holdings]
         names += [{"ticker": w["ticker"], "bucket": "candidate", "sector": w.get("sector"),
-                   "type": w.get("type"), "sub_theme": w.get("sub_theme")}
+                   "type": w.get("type")}
                   for w in watch if w["ticker"] not in held_set]
         names += [{"ticker": row["ticker"], "bucket": "discovery", "sector": row["sector"],
                    "type": row["type"], "discovery_source": row["discovery_source"]}
@@ -1196,7 +1204,7 @@ def main() -> int:
                   for row in screened_sector_etfs if row["ticker"] not in held_set
                   and row["ticker"] not in {item["ticker"] for item in watch}]
         context = scout_model_context(args.date, macro, headlines, strength, args.sectors,
-                                      names, ranked, list(subthemes))
+                                      names, ranked)
         rank_tokens = max(int(scout["max_tokens"] or 6000), 1)
         log(f"one scout call ({scout_model})")
         retry_limit = 0 if args.single_call else 2

@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from tradingagents.agents.context import get_instrument_context_from_state, get_language_instruction
-from tradingagents.agents.schemas import ResearchPlan, render_research_plan
+from tradingagents.agents.schemas import (
+    InstrumentResearchPlan,
+    ResearchPlan,
+    render_instrument_research_plan,
+    render_research_plan,
+)
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
     bind_structured,
@@ -11,8 +16,10 @@ from tradingagents.agents.structured import (
 )
 
 
-def create_research_manager(llm):
-    structured_llm = bind_structured(llm, ResearchPlan, "Research Manager")
+def create_research_manager(llm, research_only: bool = False):
+    schema = InstrumentResearchPlan if research_only else ResearchPlan
+    renderer = render_instrument_research_plan if research_only else render_research_plan
+    structured_llm = bind_structured(llm, schema, "Research Manager")
 
     def research_manager_node(state) -> dict:
         instrument_context = get_instrument_context_from_state(state)
@@ -20,7 +27,20 @@ def create_research_manager(llm):
 
         investment_debate_state = state["investment_debate_state"]
 
-        prompt = f"""As the Research Manager and debate facilitator, your role is to critically evaluate this round of debate and deliver a clear, actionable investment plan for the trader.
+        if research_only:
+            prompt = f"""As the Research Manager for an instrument research desk, evaluate the bull/bear debate and report the merits and risks of this instrument. You do not know the user's holdings, cash or portfolio and must not recommend an order, quantity, allocation, percentage of cash, or standard allocation.
+
+{instrument_context}
+
+Debate History:
+{history}
+
+Provide an attractive, neutral, avoid, or unclear outlook with the strongest thesis and counter-thesis. Give a valuation target or range and method only when supported; otherwise leave it unknown and state why. Give a thesis horizon only when evidence supports one. Include catalysts, dated sentiment, conditional instrument price levels, risks and unknowns. Numeric company financial facts and instrument price levels are research, not user sizing.
+
+Return the research fields in the structured schema. Do not infer a user's portfolio or make a transaction recommendation.
+{NO_EXTERNAL_TOOLS}""" + get_language_instruction()
+        else:
+            prompt = f"""As the Research Manager and debate facilitator, your role is to critically evaluate this round of debate and deliver a clear, actionable investment plan for the trader.
 
 {instrument_context}
 
@@ -54,7 +74,7 @@ Write these sections, in this order, starting with the recommendation on its own
             structured_llm,
             llm,
             prompt,
-            render_research_plan,
+            renderer,
             "Research Manager",
         )
 

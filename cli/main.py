@@ -53,6 +53,11 @@ def analyze(
         help="JSON file with current holdings and cash, so the trader, risk and "
         "portfolio agents size against your actual position.",
     ),
+    research_only: bool = typer.Option(
+        False,
+        "--research-only",
+        help="Run instrument research without portfolio input or account-specific sizing instructions.",
+    ),
     ticker: str = typer.Option(None, "--ticker", help="Ticker to analyze, e.g. NVDA or 0700.HK; skips the prompt"),
     date: str = typer.Option(None, "--date", help="Analysis date, YYYY-MM-DD; skips the prompt"),
     analysts: str = typer.Option(
@@ -76,6 +81,9 @@ def analyze(
     """
     if ctx.invoked_subcommand is not None:
         return
+    if research_only and portfolio:
+        console.print("[red]--research-only cannot be combined with --portfolio[/red]")
+        raise typer.Exit(code=1)
     if clear_checkpoints:
         from tradingagents.graph.checkpointer import clear_all_checkpoints
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
@@ -90,6 +98,8 @@ def analyze(
 
     try:
         flags = {"ticker": ticker, "date": date, "analysts": analysts, "save": save, "show": show, "html": html}
+        if research_only:
+            flags["research_only"] = True
         run_analysis(checkpoint=checkpoint, portfolio=portfolio_context, flags=flags)
     except _NO_CONSOLE_ERRORS:
         # A terminal with no console buffer cannot host the interactive prompts.

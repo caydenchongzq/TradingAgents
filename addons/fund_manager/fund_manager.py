@@ -25,6 +25,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,8 @@ if str(ADDONS_ROOT) not in sys.path:
     sys.path.insert(0, str(ADDONS_ROOT))
 from portfolio_book import PortfolioBookError, normalize_book
 from trade_validation import TradePolicyError, parse_trade_policy, validate_trades as validate_account_trades
+from decision_continuity import (attach_position_results, build_decision_context,
+                                 previous_review, validate_decision_contract)
 DATA_ROOT = Path(os.getenv("FM_DATA_ROOT", "/home/appuser/.tradingagents"))
 DEFAULT_MODEL = os.getenv("FUND_MANAGER_MODEL", "openai/gpt-6.1-sol")
 # Quick model already used for per-stock runs (cli prefs: openai/gpt-6-luna).
@@ -186,20 +189,58 @@ def parse_report(tk: str, d: Path, include_risk: bool, max_chars: int) -> dict:
     analysis_date = re.search(r"Analysis date:\s*(\S+)", header)
     generated = re.search(r"Generated:\s*(.+)", header)
     rating = _field(pm, "Rating") or (re.search(r"- Rating:\s*(.+)", header) or [None, None])[1]
+    brief = load_research_brief(d, tk)
+    if (d / "research_brief.json").exists() and brief is None:
+        # A malformed/unsupported profile cannot be certified as either new
+        # research-only output or safe legacy evidence.
+        return {"ticker": tk, "report_dir": d.name, "analysis_date": None,
+                "generated_utc": None, "pm_rating": "unknown report profile",
+                "pm_price_target": None, "pm_time_horizon": None,
+                "trader_action": None, "trader_position_sizing": None,
+                "trader_stop_loss": None, "trader_entry": None,
+                "source_status": "unknown", "research_brief": None,
+                "legacy_evidence": None, "pm_decision": None,
+                "research_manager": None, "gists": {}}
+    if brief:
+        return {
+            "ticker": tk, "report_dir": d.name,
+            "analysis_date": brief["analysis_date"], "generated_utc": brief["generated_utc"],
+            "pm_rating": brief["outlook"], "pm_price_target": brief["valuation"].get("target_price"),
+            "pm_target_range": brief["valuation"].get("target_range"),
+            "pm_time_horizon": brief.get("thesis_horizon"), "trader_action": None,
+            "trader_position_sizing": None, "trader_stop_loss": None, "trader_entry": None,
+            "source_status": "research_only", "research_brief": brief,
+            "legacy_evidence": None, "pm_decision": None, "research_manager": None,
+            "gists": {"bull": "", "bear": "", "research_manager": None,
+                      "risk_aggressive": "", "risk_conservative": "", "risk_neutral": ""},
+        }
     out = {
         "ticker": tk,
         "report_dir": d.name,
         "analysis_date": analysis_date.group(1) if analysis_date else None,
         "generated_utc": generated.group(1).strip() if generated else None,
-        "pm_rating": rating,
+        "pm_rating": "legacy portfolio-aware rating excluded" if rating else None,
         "pm_price_target": _field(pm, "Price Target"),
         "pm_time_horizon": _field(pm, "Time Horizon"),
         "trader_action": _field(trader, "Action"),
         "trader_position_sizing": _field(trader, "Position Sizing"),
         "trader_stop_loss": _field(trader, "Stop Loss"),
         "trader_entry": _field(trader, "Entry Price"),
-        "pm_decision": _read(d / "5_portfolio" / "decision.md", max_chars) or pm[:max_chars],
-        "research_manager": _read(d / "2_research" / "manager.md", max_chars // 2),
+        "source_status": "legacy_portfolio_aware",
+        "research_brief": None,
+        "legacy_evidence": {name: _read(d / rel, max_chars // 4)
+                            for name, rel in {
+                                "market": "1_analysts/market.md",
+                                "sentiment": "1_analysts/sentiment.md",
+                                "news": "1_analysts/news.md",
+                                "fundamentals": "1_analysts/fundamentals.md",
+                                "bull": "2_research/bull.md",
+                                "bear": "2_research/bear.md",
+                            }.items()},
+        # A legacy PM/Trader/Research Manager saw allocation context. Never
+        # forward their recommendation or sizing narrative as current research.
+        "pm_decision": None,
+        "research_manager": None,
     }
     out["gists"] = {
         "bull": _gist_debater(_read(d / "2_research" / "bull.md")),
@@ -214,6 +255,107 @@ def parse_report(tk: str, d: Path, include_risk: bool, max_chars: int) -> dict:
             for k in ("aggressive", "conservative", "neutral")
         }
     return out
+
+
+def _brief_text(value, limit: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError("research brief text field is invalid")
+    value = value.strip()
+    if not value or len(value) > limit:
+        raise ValueError("research brief text field is empty or too long")
+    return value
+
+
+def load_research_brief(report_dir: Path, ticker: str) -> dict | None:
+    """Read only the explicitly versioned, account-blind instrument contract."""
+    path = report_dir / "research_brief.json"
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("schema_version") != 1 or raw.get("profile") != "research_only":
+            return None
+        forbidden = {"account", "account_id", "shares", "quantity", "position_sizing", "target_shares",
+                     "portfolio", "holdings", "cash", "allocation", "order", "trade", "recommended_action"}
+        def has_portfolio_fields(value):
+            if isinstance(value, dict):
+                return any(str(key).lower() in forbidden or has_portfolio_fields(item)
+                           for key, item in value.items())
+            if isinstance(value, list):
+                return any(has_portfolio_fields(item) for item in value)
+            return False
+        if has_portfolio_fields(raw):
+            return None
+        if str(raw.get("ticker") or "").strip().upper() != ticker.upper():
+            return None
+        outlook = raw.get("outlook")
+        if outlook not in {"attractive", "neutral", "avoid", "unclear"}:
+            return None
+        valuation = raw.get("valuation")
+        if not isinstance(valuation, dict):
+            return None
+        target = valuation.get("target_price")
+        if target is not None and (isinstance(target, bool) or not isinstance(target, (int, float))
+                                   or not math.isfinite(target) or target <= 0):
+            return None
+        target_range = valuation.get("target_range")
+        if target_range is not None:
+            if not isinstance(target_range, dict):
+                return None
+            low, high = target_range.get("low"), target_range.get("high")
+            if (any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0
+                    for v in (low, high)) or low > high):
+                return None
+            target_range = {"low": low, "high": high}
+        dates = raw.get("evidence_dates")
+        if not isinstance(dates, list) or any(not isinstance(item, dict) for item in dates):
+            return None
+        catalysts, risks, unknowns, levels = (raw.get(k) for k in ("catalysts", "risks", "unknowns", "conditional_levels"))
+        if any(not isinstance(value, list) or len(value) > 30 for value in (catalysts, risks, unknowns, levels)):
+            return None
+        if any(not isinstance(item, str) or len(item) > 2000 for group in (catalysts, risks, unknowns) for item in group):
+            return None
+        clean_levels = []
+        for item in levels:
+            if not isinstance(item, dict) or not isinstance(item.get("condition"), str) or not isinstance(item.get("meaning"), str):
+                return None
+            level = item.get("level")
+            if level is not None and (isinstance(level, bool) or not isinstance(level, (int, float))
+                                      or not math.isfinite(level) or level <= 0):
+                return None
+            clean_levels.append({"condition": item["condition"][:500], "level": level,
+                                 "meaning": item["meaning"][:1000]})
+        sentiment = raw.get("sentiment")
+        if not isinstance(sentiment, dict) or not isinstance(sentiment.get("summary"), str):
+            return None
+        clean_dates = []
+        for item in dates:
+            if not isinstance(item.get("source"), str) or (item.get("as_of") is not None and not isinstance(item.get("as_of"), str)):
+                return None
+            clean_dates.append({"source": item["source"][:200], "as_of": item.get("as_of")})
+        confidence = raw.get("confidence")
+        if confidence not in {"high", "medium", "low"}:
+            return None
+        horizon = raw.get("thesis_horizon")
+        if horizon is not None and (not isinstance(horizon, str) or len(horizon) > 500):
+            return None
+        return {
+            "schema_version": 1, "profile": "research_only", "ticker": ticker.upper(),
+            "analysis_date": _brief_text(raw.get("analysis_date"), 20),
+            "generated_utc": _brief_text(raw.get("generated_utc"), 64),
+            "outlook": outlook,
+            "thesis": _brief_text(raw.get("thesis"), 8000),
+            "counter_thesis": _brief_text(raw.get("counter_thesis"), 8000),
+            "valuation": {"target_price": target, "target_range": target_range,
+                          "method": str(valuation.get("method") or "")[:1000],
+                          "assumptions": str(valuation.get("assumptions") or "")[:2000]},
+            "thesis_horizon": horizon, "catalysts": catalysts, "risks": risks,
+            "sentiment": {"summary": sentiment["summary"][:3000], "as_of": sentiment.get("as_of")},
+            "conditional_levels": clean_levels, "confidence": confidence,
+            "unknowns": unknowns, "evidence_dates": clean_dates,
+        }
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 REPORT_FRESH_DAYS = 7
@@ -870,8 +1012,11 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
     report_sources = {}
     expected_reports = [str(ticker) for ticker in tickers] + [row["ticker"] for row in watchlist]
     for ticker in dict.fromkeys(expected_reports):
+        report = reports.get(ticker) or {}
         freshness = source_freshness(reports.get(ticker), anchor.isoformat())
-        report_sources[ticker] = {**freshness, "report_dir": (reports.get(ticker) or {}).get("report_dir")}
+        report_sources[ticker] = {**freshness, "report_dir": report.get("report_dir"),
+                                  "source_profile": report.get("source_status", "missing"),
+                                  "analysis_date": report.get("analysis_date")}
         if freshness["status"] == "reused":
             data_checks.append(f"{ticker}: reusing ticker report from {freshness['source_date']} ({freshness['age_days']} days old)")
         elif freshness["status"] == "stale":
@@ -1140,18 +1285,23 @@ def build_stats(book: dict, close: pd.DataFrame, quotes: dict, themes: dict, tar
 
 # --------------------------------------------------------------------------- prompts & schemas
 FM_SYSTEM = """You are the senior Fund Manager / CIO sitting on top of a TradingAgents desk.
-For each holding (and any watchlist candidate with a report) a team of analysts, bull/bear researchers,
-a trader, a risk debate and a Portfolio Manager has produced a single-stock decision. Those PMs judged ONE
-stock at a time and did NOT see portfolio weights, correlations or concentration. You make the
-whole-portfolio decision they could not.
+Instrument reports are research evidence, not portfolio allocation decisions. New research-only briefs
+are account-blind; legacy analyst and bull/bear evidence may be used but old trader sizing and legacy
+portfolio-manager/research-manager advice must not be treated as current authority. You alone decide
+whole-portfolio exposure, account-specific actions, quantities and review timing.
 
 Rules:
 1. Diagnose the portfolio from the quantitative stats (weights, P&L, vol, 1y/2y beta, risk contribution,
    correlation clusters, VaR, stress, concentration, drift) plus the market regime and macro snapshot.
-2. For EVERY account holding decide keep / trim / exit / add. Identify the account for every trade.
+2. For EVERY account holding decide keep / trim / exit / add. Identify the account for every trade and
+   include every active watchlist candidate in candidate_coverage exactly once, including missing or stale evidence.
    Buys and trims use whole shares; a complete exit may include a fractional available remainder. Never
    sell more than held. No shorting, options or margin; use only the provided quote and account cash.
-3. Weigh each single-stock PM view against portfolio context. You may size differently or override; say so.
+3. Weigh dated thesis and risk evidence against the full book and alternatives. Consider HOLD, a full
+   adjustment, and staging when a material exposure change is proposed. The minimum buy is an economic
+   floor, never a target order size. State target_shares, review_horizon, sizing_rationale, execution_intent,
+   condition, and change_reason for each position decision. A target is a proposal, not a mandate.
+   Reconsider relevant prior objections and explain changes without assuming earlier advice was filled.
 4. Only `approved_targets_pct` contains owner-approved allocation targets; absent entries are not mandates.
    Cash is NOT fixed: choose a proposed target cash % each run. The approved cash reference is a guideline,
    not a minimum; 0% cash is allowed when justified. Consider
@@ -1192,9 +1342,11 @@ Rules:
     A swing-role ETF can have swing entry and invalidation conditions; a long-term ETF can have a thesis-based
     reassessment condition. Do not invent tight price stops when evidence does not support them. State the
     assumption and explain unassigned roles. Each position and candidate already carries `sleeve`.
-10. Check `report_sources` and `scout_source` before relying on reused evidence. Ticker reports older than
+10. Check `decision_context`, `report_sources` and `scout_source` before relying on reused evidence. Ticker reports older than
     seven calendar days are marked stale; missing, undated, future-dated, and stale reports are evidence gaps.
-    Treat scout rankings and ideas as dated research context, never as approved watchlist changes.
+    Treat scout rankings and ideas as dated research context, never as approved watchlist changes. Set
+    candidate dispositions to selected, watch, pass, or insufficient_evidence; selected must correspond to
+    a proposed account-scoped BUY, while watch/pass do not create trades. Use `decision_contract_version: 2`.
 This is decision support, not financial advice."""
 
 ANALYST_ROLES = {
@@ -1216,7 +1368,8 @@ watchlist candidates. Debate the CASH level explicitly (give your own target cas
 soft owner guidance). Core ETF and swing are analysis groupings by instrument type, not owner-approved roles.
 Review investment roles and reassessment conditions from the proposed role and evidence, regardless of
 instrument type. Do not invent a tight stop without evidence.
-   Respond directly to the other analysts' earlier points where present. Propose specific account-scoped changes
+   Respond directly to the other analysts' earlier points where present. Challenge HOLD versus full or staged
+adjustments and compare opportunity cost across holdings and candidates. Propose specific account-scoped changes
 (ticker, action, shares) or say 'no change'. Be concise and numeric (<= ~500 words of content)."""
 
 
@@ -1228,7 +1381,7 @@ S, N, I = {"type": "string"}, {"type": "number"}, {"type": "integer"}
 NN = {"type": ["number", "null"]}
 ARR_S = {"type": "array", "items": S}
 
-TRADE_ITEM = _obj({
+LEGACY_TRADE_ITEM = _obj({
     "ticker": S,
     "account_id": S,
     "is_holding": {"type": "boolean"},
@@ -1241,16 +1394,36 @@ TRADE_ITEM = _obj({
     "follows_agent": {"type": "string", "enum": ["agrees", "sizes_differently", "overrides", "no_agent_report"]},
     "rationale": S,
 })
+TRADE_ITEM = _obj({
+    **LEGACY_TRADE_ITEM["properties"],
+    "shares": {**N, "description": "Proposed order quantity: 0 for HOLD; whole shares for buys/trims; fractional shares only for complete exits."},
+    "target_shares": {**NN, "description": "Proposed total target position/exposure, not an order quantity; a staged order may move partway toward that target. Null is allowed when unavailable. For HOLD, use observed account shares when known."},
+    "review_horizon": S,
+    "sizing_rationale": S,
+    "execution_intent": {"type": "string", "enum": ["current", "deferred", "none"],
+                          "description": "HOLD requires none. Use deferred only with a positive BUY/SELL quantity and a future condition."},
+    "condition": {**S, "description": "For deferred BUY/SELL, state the future trigger. A HOLD reassessment note does not imply an order."},
+    "change_reason": S,
+})
 CASH_DECISION = _obj({
     "target_cash_pct": N, "regime": {"type": "string", "enum": ["risk_on", "neutral", "cautious", "risk_off", "crisis"]},
     "regime_signals": ARR_S, "rationale": S, "deploy_conditions": ARR_S, "raise_conditions": ARR_S,
 })
 PLAN_PROPS = {
+    "decision_contract_version": {"type": "integer", "enum": [2]},
     "headline": S, "diagnosis": S, "cash_decision": CASH_DECISION,
     "key_risks": {"type": "array", "items": _obj({"risk": S, "severity": {"type": "string", "enum": ["high", "medium", "low"]}, "detail": S})},
     "correlation_clusters": {"type": "array", "items": _obj({"name": S, "tickers": ARR_S, "comment": S})},
     "decision_summary": S,
     "trades": {"type": "array", "items": TRADE_ITEM},
+    "candidate_coverage": {"type": "array", "items": _obj({
+        "ticker": S,
+        "disposition": {"type": "string", "enum": ["selected", "watch", "pass", "insufficient_evidence"]},
+        "rationale": S,
+        "research_status": S,
+        "source_profile": S,
+        "evidence_date": {"type": ["string", "null"]},
+    })},
     "swaps_considered": {"type": "array", "items": _obj({"from": S, "to": S, "verdict": {"type": "string", "enum": ["do_now", "staged", "watch", "reject"]}, "reason": S})},
     "priority_order": ARR_S,
     "cash_plan": _obj({"summary": S, "deployments": {"type": "array", "items": _obj({"use": S, "amount_usd": N, "condition": S})}}),
@@ -1258,6 +1431,25 @@ PLAN_PROPS = {
     "what_would_change_my_mind": ARR_S, "data_gaps": ARR_S,
     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
 }
+# Keep exact pre-v2 schemas registered for journal recovery. New calls use
+# explicitly versioned response names, so changing current requirements never
+# makes old saved responses unrecoverable.
+LEGACY_PLAN_PROPS = {
+    "headline": S, "diagnosis": S, "cash_decision": CASH_DECISION,
+    "key_risks": PLAN_PROPS["key_risks"], "correlation_clusters": PLAN_PROPS["correlation_clusters"],
+    "decision_summary": S, "trades": {"type": "array", "items": LEGACY_TRADE_ITEM},
+    "swaps_considered": PLAN_PROPS["swaps_considered"], "priority_order": ARR_S,
+    "cash_plan": PLAN_PROPS["cash_plan"], "levels": PLAN_PROPS["levels"],
+    "what_would_change_my_mind": ARR_S, "data_gaps": ARR_S,
+    "confidence": PLAN_PROPS["confidence"],
+}
+LEGACY_DRAFT_SCHEMA = _obj(LEGACY_PLAN_PROPS)
+LEGACY_FINAL_SCHEMA = _obj({
+    **LEGACY_PLAN_PROPS,
+    "debate_takeaways": {"type": "array", "items": _obj({"analyst": S, "point": S,
+        "accepted": {"type": "string", "enum": ["accepted", "partly", "rejected"]}, "response": S})},
+    "changes_vs_draft": {"type": "array", "items": _obj({"item": S, "draft": S, "final": S, "reason": S})},
+})
 DRAFT_SCHEMA = _obj(PLAN_PROPS)
 FINAL_SCHEMA = _obj({
     **PLAN_PROPS,
@@ -1274,7 +1466,8 @@ ANALYST_SCHEMA = _obj({
 })
 
 
-def build_context(book, targets, stats, reports, macro, as_of, scout_report: dict | None = None) -> str:
+def build_context(book, targets, stats, reports, macro, as_of, scout_report: dict | None = None,
+                  decision_context: dict | None = None) -> str:
     slim_pos = [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items() if k != "price_source"}
                 for r in stats["positions"]]
     stats_view = {k: v for k, v in stats.items() if k not in ("positions", "watchlist")}
@@ -1286,43 +1479,65 @@ def build_context(book, targets, stats, reports, macro, as_of, scout_report: dic
     guidance = approved_portfolio_guidance(targets)
     if guidance:
         owner_policy["portfolio_guidance"] = guidance
+    owner_policy_text = json.dumps(owner_policy, indent=1) if owner_policy else "none provided"
+    if guidance:
+        owner_policy_text += (
+            "\n\n## Owner-approved portfolio guidelines (soft, not a rebalance mandate)\n"
+            f"Use {guidance['cash_reference_pct']:g}% cash, {guidance['long_term_pct']:g}% long-term and "
+            f"{guidance['swing_pct']:g}% swing as a starting mix of the whole account. "
+            f"Cash can be below {guidance['cash_reference_pct']:g}%, including zero, when opportunities justify it; "
+            "state the reason and reduced flexibility. Recommend long-term or swing roles from each holding's "
+            "evidence, regardless of whether it is a stock or ETF. Sector weights are guidelines, not "
+            "equal-weight requirements. No automatic trades or forced rebalancing. For swing ideas, give a "
+            "flexible horizon, entry conditions, position-size rationale and invalidation/exit conditions. "
+            "Discuss market protection and diversification without claiming downturns can be reliably predicted."
+        )
     parts = [
         f"# Fund review - decision date {as_of}",
+        "## Decision encoding contract (applies to draft and final plans)",
+        "Encode HOLD as shares=0 and execution_intent=none. Set target_shares to the observed account quantity when known; null is allowed when unavailable. A review horizon, reassessment level, or possible future opportunity is not a deferred order. Use execution_intent=deferred only for an actual conditional BUY or SELL, with positive proposed shares and an explicit future condition. `shares` is the proposed order quantity; `target_shares` is the proposed total target position/exposure, and a staged order may move partway toward that target. These are advisory proposals only.",
         "## Book (shares, average cost, cash)", json.dumps(book, indent=1),
         "## Owner-approved allocation targets and soft portfolio guidance (missing fields are not mandates)",
-        json.dumps(owner_policy, indent=1) if owner_policy else "none provided",
+        owner_policy_text,
         "## Trade policy (per account; deterministic checks apply these limits)",
         json.dumps(stats.get("trade_policy") or {}, indent=1),
         "## Positions with live prices and per-stock stats", json.dumps(slim_pos, indent=1),
         "## Portfolio-level quantitative stats, regime and configured safeguards", json.dumps(stats_view, indent=1),
         "## Dated theme scout report and freshness (ideas and ranking are evidence, not approved changes)",
         json.dumps(scout_report or {"status": "missing", "date": None, "report": None}, indent=1),
+        "## Prior completed fund review (advice and snapshots do not establish fills)",
+        json.dumps(decision_context or {"baseline_status": "unavailable", "comparisons": []}, indent=1),
         "## Macro snapshot (FRED, latest values)", json.dumps(macro, indent=1) if macro else "not fetched",
         "## Watchlist candidates (NOT held)",
         json.dumps(stats["watchlist"], indent=1) if stats["watchlist"] else "none",
-        "## Single-stock agent decisions (latest TradingAgents run per ticker)",
+        "## Instrument research (latest saved report per ticker; provenance and dates are evidence)",
     ]
-    if guidance:
-        parts.insert(4, "## Owner-approved portfolio guidelines (soft, not a rebalance mandate)\n"
-                     f"Use {guidance['cash_reference_pct']:g}% cash, {guidance['long_term_pct']:g}% long-term and "
-                     f"{guidance['swing_pct']:g}% swing as a starting mix of the whole account. "
-                     f"Cash can be below {guidance['cash_reference_pct']:g}%, including zero, when opportunities justify it; "
-                     "state the reason and reduced flexibility. Recommend long-term or swing roles from each holding's "
-                     "evidence, regardless of whether it is a stock or ETF. Sector weights are guidelines, not "
-                     "equal-weight requirements. No automatic trades or forced rebalancing. For swing ideas, give a "
-                     "flexible horizon, entry conditions, position-size rationale and invalidation/exit conditions. "
-                     "Discuss market protection and diversification without claiming downturns can be reliably predicted.")
     for tk, r in reports.items():
         tag = "HOLDING" if tk in {p["ticker"] for p in book["positions"]} else "CANDIDATE"
-        parts.append(f"### [{tag}] {tk} - PM rating: {r['pm_rating']} | trader: {r['trader_action']} "
-                     f"| analysis date {r['analysis_date']} | report {r['report_dir']}")
-        parts.append(f"Trader position sizing: {r['trader_position_sizing']}")
-        parts.append("Portfolio Manager decision:\n" + (r["pm_decision"] or "(missing)"))
-        if r.get("research_manager"):
-            parts.append("Research Manager plan:\n" + r["research_manager"])
-        if r.get("risk_debate"):
-            for k, v in r["risk_debate"].items():
-                parts.append(f"Risk ({k}):\n{v}")
+        freshness = source_freshness(r, as_of)
+        parts.append(f"### [{tag}] {tk} - profile: {r.get('source_status', 'unknown')} | "
+                     f"evidence date: {r.get('analysis_date') or 'unknown'} | freshness: {freshness['status']} "
+                     f"| report: {r.get('report_dir') or 'missing'}")
+        if r.get("research_brief"):
+            parts.append("Validated research-only brief:\n" + json.dumps(r["research_brief"], ensure_ascii=False, indent=1))
+        elif r.get("legacy_evidence"):
+            parts.append("Safe legacy instrument evidence (analyst and bull/bear only; legacy downstream advice is excluded):")
+            for name, content in r["legacy_evidence"].items():
+                if content:
+                    parts.append(f"{name}:\n{content}")
+        else:
+            parts.append("No safe instrument research evidence is available.")
+    candidates = [c for c in stats.get("watchlist") or []]
+    candidate_lines = []
+    for candidate in candidates:
+        ticker = str(candidate.get("ticker") or "").upper()
+        report = reports.get(ticker)
+        freshness = source_freshness(report, as_of)
+        candidate_lines.append({"ticker": ticker, "research_status": freshness["status"],
+                                "source_profile": report.get("source_status") if report else "missing",
+                                "evidence_date": (report or {}).get("analysis_date")})
+    parts.append("## Required candidate coverage universe (include every row exactly once in candidate_coverage)")
+    parts.append(json.dumps(candidate_lines, indent=1) if candidate_lines else "No active watchlist candidates.")
     return "\n\n".join(parts)
 
 
@@ -1602,7 +1817,8 @@ def _unvalidated_outputs(attempt_path: Path) -> list[dict]:
         include, reason = False, None
         if parsed.get("status") != "valid":
             include, reason = True, parsed.get("error") or "Structured response validation failed"
-        elif schema_name in ("fund_manager_draft", "fund_manager_final") and trade.get("status") != "valid":
+        elif schema_name in ("fund_manager_draft", "fund_manager_final",
+                             "fund_manager_draft_v2", "fund_manager_final_v2") and trade.get("status") != "valid":
             include, reason = True, trade.get("error") or parsed.get("cost_error") or "Decision not deterministically trade-validated"
         elif schema_name in ("aggressive_risk_view", "conservative_risk_view", "neutral_risk_view") and response.get("label") not in debate_results:
             include, reason = True, parsed.get("cost_error") or "Risk response was not accepted into the completed debate"
@@ -1832,6 +2048,8 @@ def _legacy_validate_trades(decision: dict, stats: dict) -> dict:
 
 def validate_trades(decision: dict, stats: dict) -> dict:
     """Use the deterministic fee/account validator, then retain legacy risk summaries."""
+    if decision.get("decision_contract_version") == 2:
+        validate_decision_contract(decision, stats)
     effective = validate_account_trades(decision, stats, policy=stats.get("trade_policy"))
     holding_info = {p.get("ticker"): p for p in stats.get("positions", [])}
     candidate_info = {p.get("ticker"): p for p in stats.get("watchlist", [])}
@@ -1971,15 +2189,21 @@ def _cell(x, n=220):
 
 def render_plan_trades(L, plan, check, targets, sleeve=None):
     order = {tk: i for i, tk in enumerate(plan.get("priority_order", []))}
+    position_results = {(str(row.get("account_id") or ""), str(row.get("ticker") or "").upper()): row
+                        for row in plan.get("position_results", []) if isinstance(row, dict)}
     trades = sorted(check["trades"], key=lambda t: order.get(t["ticker"], 99))
-    L.append("| # | Account | Ticker | Proposed role | Decision | Action | Proposed shares | Effective shares | Est. price | Value | Fee | Status | Reason | Order | Limit | Timing | Agent rating | vs agent | Rationale |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("| # | Account | Ticker | Decision | Action | Intent | Observed | Target | After | Gap | Position status | Proposed | Effective | Review horizon | Condition | Value | Fee | Validation | Change reason | Sizing rationale | Decision rationale |")
+    L.append("|---|---|---|---|---|---|---:|---:|---:|---:|---|---:|---:|---|---|---:|---:|---|---|---|---|")
     for i, t in enumerate(trades, 1):
-        L.append(f"| {i} | {_cell(t.get('account_id'), 80)} | {t['ticker']}{'' if t.get('is_holding', True) else ' (new)'} | {t.get('investment_role', 'unassigned')} | {t.get('decision', '')} | "
-                 f"{t['action']} | {fmt_quantity(t.get('proposed_shares', t.get('shares')))} | {fmt_quantity(t.get('effective_shares', t.get('shares')))} | {fmt_number(t.get('calc_price'))} | {fmt_money(t.get('value_usd'))} | {fmt_money(t.get('fee_usd'))} | {t.get('status', 'accepted')} | {_cell(t.get('reason'), 180)} | "
-                 f"{t.get('order_type', '')} | {'' if t.get('limit_price') in (None, 0) else t['limit_price']} | "
-                 f"{_cell(t.get('timing'), 160)} | {t.get('agent_rating', '')} | {t.get('follows_agent', '')} | "
-                 f"{_cell(t.get('rationale'), 400)} |")
+        result = position_results.get((str(t.get("account_id") or ""), str(t.get("ticker") or "").upper()), {})
+        L.append(f"| {i} | {_cell(t.get('account_id'), 80)} | {t['ticker']}{'' if t.get('is_holding', True) else ' (new)'} | {t.get('decision', '')} | "
+                 f"{t['action']} | {t.get('execution_intent', 'legacy')} | {fmt_quantity(result.get('observed_shares'))} | "
+                 f"{fmt_quantity(t.get('target_shares'))} | {fmt_quantity(result.get('hypothetical_after_shares'))} | "
+                 f"{fmt_quantity(result.get('target_gap_shares'))} | {result.get('position_status', 'unknown')} | "
+                 f"{fmt_quantity(t.get('proposed_shares', t.get('shares')))} | {fmt_quantity(t.get('effective_shares', t.get('shares')))} | "
+                 f"{_cell(t.get('review_horizon'), 100)} | {_cell(t.get('condition'), 180)} | "
+                 f"{fmt_money(t.get('value_usd'))} | {fmt_money(t.get('fee_usd'))} | {t.get('status', 'accepted')} | "
+                 f"{_cell(t.get('change_reason'), 180)} | {_cell(t.get('sizing_rationale'), 240)} | {_cell(t.get('rationale'), 300)} |")
     L.append(f"\nPriority order: {' -> '.join(plan.get('priority_order', []))}\n")
     L.append("### Post-trade check (computed by the add-on, not the model)")
     policy = check.get("trade_policy") or {}
@@ -2050,6 +2274,36 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
         L.append("\n**Raise cash when:**\n" + "\n".join(f"- {x}" for x in cd.get("raise_conditions", [])) + "\n")
         L.append(f"## Diagnosis\n{plan.get('diagnosis', '')}\n")
         L.append(f"## Decision\n{plan.get('decision_summary', '')}\n")
+        context = plan.get("decision_context") or {}
+        L.append("## Previous review and observed changes")
+        if context.get("baseline_status") != "available":
+            L.append(f"No eligible completed review baseline is available ({context.get('baseline_status', 'unknown')}).")
+        else:
+            L.append(f"Prior review: {context.get('prior_report_date')} / {context.get('prior_run_id')}. "
+                     "Observed quantity changes do not prove fills.")
+            L.append(f"Chronology basis: {context.get('selection_basis', 'unknown')}"
+                     + (f" ({context['time_order_uncertainty']})" if context.get("time_order_uncertainty") else "."))
+            if context.get("prior_decision_summary"):
+                L.append("Prior decision summary: " + _cell(context["prior_decision_summary"], 1500))
+            if context.get("prior_objections"):
+                L.append("Prior risk committee objections and manager responses:")
+                L += [f"- [{row.get('analyst')}] {row.get('accepted')}: {_cell(row.get('point'), 300)} "
+                      f"Manager: {_cell(row.get('response'), 300)}" for row in context["prior_objections"]]
+            comparisons = context.get("comparisons") or []
+            if comparisons:
+                L.append("| Account | Ticker | Prior observed | Current observed | Change | Prior advice | Prior intent | Prior validation | Comparison |\n|---|---|---:|---:|---:|---|---|---|---|")
+                for row in comparisons:
+                    L.append(f"| {row.get('account_id')} | {row.get('ticker')} | {fmt_quantity(row.get('prior_observed_shares'))} | "
+                             f"{fmt_quantity(row.get('observed_shares'))} | {fmt_quantity(row.get('quantity_change'))} | "
+                             f"{row.get('prior_decision') or 'unknown'} {fmt_quantity(row.get('prior_proposed_shares'))} | "
+                             f"{row.get('prior_intent') or 'unknown'} | {row.get('prior_validation_status') or 'unknown'} | "
+                             f"{row.get('comparison_status')} |")
+        if plan.get("candidate_coverage"):
+            L.append("\n## Watchlist candidate coverage")
+            L.append("| Ticker | Disposition | Evidence profile | Research freshness | Evidence date | Rationale |\n|---|---|---|---|---|---|")
+            for row in plan["candidate_coverage"]:
+                L.append(f"| {row.get('ticker')} | {row.get('disposition')} | {row.get('source_profile')} | "
+                         f"{row.get('research_status')} | {row.get('evidence_date') or 'unknown'} | {_cell(row.get('rationale'), 250)} |")
         if final:
             L.append("## What changed vs the draft")
             dd = diff_plans(draft, final)
@@ -2111,18 +2365,21 @@ def render_markdown(as_of, models, stats, reports, macro, calls, draft, debate, 
             L += [f"| {t['ticker']} | {t['action']} | {t['shares']} | {t.get('decision', '')} |" for t in check_d["trades"]]
             L.append(f"\nDraft headline: {draft.get('headline', '')} | draft ending cash {fmt_money(check_d['ending_cash'])} ({check_d['ending_cash_pct']}%)")
 
-    # side-by-side per-stock agent views
-    L.append("\n---\n## Per-stock agent views (side by side)")
+    # Compact instrument research provenance, without old portfolio-aware sizing advice.
+    L.append("\n---\n## Instrument research coverage")
     fin_map = {t["ticker"]: t for t in (check["trades"] if check else [])}
-    L.append("| Ticker | Bull | Bear | Research mgr | Trader | Risk team (agg / cons / neutral) | PM rating | Fund manager |")
-    L.append("|---|---|---|---|---|---|---|---|")
+    L.append("| Ticker | Profile | Outlook | Evidence date | Thesis / evidence summary | Fund manager decision |")
+    L.append("|---|---|---|---|---|---|")
     for tk, r in reports.items():
-        g = r.get("gists", {})
+        brief = r.get("research_brief") or {}
+        legacy = r.get("legacy_evidence") or {}
         fm = fin_map.get(tk)
-        fm_txt = f"{fm['action']} {fm['shares']} ({fm.get('decision', '')})" if fm else ""
-        L.append(f"| {tk} | {_cell(g.get('bull'), 200)} | {_cell(g.get('bear'), 200)} | {g.get('research_manager') or ''} | "
-                 f"{r.get('trader_action') or ''} | A: {_cell(g.get('risk_aggressive'), 150)}<br>C: {_cell(g.get('risk_conservative'), 150)}"
-                 f"<br>N: {_cell(g.get('risk_neutral'), 150)} | **{r.get('pm_rating')}** | {fm_txt} |")
+        fm_txt = f"{fm['action']} {fmt_quantity(fm.get('effective_shares'))} ({fm.get('execution_intent', 'legacy')})" if fm else "No proposal"
+        summary = brief.get("thesis") or "Legacy instrument evidence only; downstream sizing advice excluded."
+        if not brief and legacy:
+            summary = "Bull: " + _gist_debater(legacy.get("bull", "")) + "; Bear: " + _gist_debater(legacy.get("bear", ""))
+        L.append(f"| {tk} | {r.get('source_status', 'unknown')} | {brief.get('outlook', 'legacy / unknown')} | "
+                 f"{r.get('analysis_date') or 'unknown'} | {_cell(summary, 500)} | {fm_txt} |")
 
     # quant appendix
     L.append("\n---\n## Appendix A - Portfolio snapshot")
@@ -2337,11 +2594,15 @@ def main() -> int:
     for msg in stats["data_checks"]:
         log(f"  data check: {msg}")
 
-    run_id = datetime.now().strftime("%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    run_started_utc = datetime.now(timezone.utc)
+    run_id = run_started_utc.astimezone(ZoneInfo("America/New_York")).strftime("%H%M%S") + "_" + uuid.uuid4().hex[:6]
     out_dir = Path(args.out_dir) / args.date / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     pre = "snapshot_" if args.no_llm else ""
-    context = build_context(book, targets, stats, reports, macro, args.date, scout_report)
+    prior = previous_review(Path(args.out_dir), args.date, run_id, run_started_utc)
+    prior_path, prior_report = prior if prior else (None, None)
+    decision_context = build_decision_context(book, prior_path, prior_report, reports)
+    context = build_context(book, targets, stats, reports, macro, args.date, scout_report, decision_context)
     if args.context_file:
         extra_path = Path(args.context_file)
         if not extra_path.is_file():
@@ -2381,18 +2642,20 @@ def main() -> int:
             log(f"[1/3] fund manager DRAFT ({fm_spec['model']}, prompt ~{len(context) // 4:,} tokens) ...")
             r = call_llm(fm_spec["model"], fm_spec["system"], context + "\n\n## Task\nWrite your DRAFT whole-portfolio plan. Every holding must "
                          "appear exactly once in `trades` (HOLD 0 if unchanged); add watchlist buys only if justified.",
-                         DRAFT_SCHEMA, "fund_manager_draft", fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/draft",
+                         DRAFT_SCHEMA, "fund_manager_draft_v2", fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/draft",
                          fm_spec.get("temperature"), attempt_path)
             r["model_req"] = args.model
             calls.append(r)
             candidate_draft = r["parsed"]
             if candidate_draft is None:
                 raise RuntimeError("no response passed structured schema validation; raw response was preserved")
+            candidate_draft["decision_context"] = decision_context
             try:
                 candidate_check_d = validate_candidate(candidate_draft, stats, r["label"], attempt_path,
                                                        r.get("attempt_id"))
             except Exception as exc:
                 raise RuntimeError(f"draft failed deterministic trade validation: {exc}") from exc
+            candidate_draft["position_results"] = attach_position_results(candidate_draft, stats, candidate_check_d)
             draft, check_d = candidate_draft, candidate_check_d
             if args.risk_rounds > 0:
                 stage = "risk_debate"
@@ -2411,17 +2674,19 @@ def main() -> int:
                           "(do not just average), revisit the cash target, and list every change vs the draft with the reason "
                           "in `changes_vs_draft` (empty list if none). Summarise how you treated the key debate points in "
                           "`debate_takeaways`. Every holding must appear exactly once in `trades`.")
-                r = call_llm(fm_spec["model"], fm_spec["system"], user, FINAL_SCHEMA, "fund_manager_final",
+                r = call_llm(fm_spec["model"], fm_spec["system"], user, FINAL_SCHEMA, "fund_manager_final_v2",
                              fm_spec["max_tokens"], eff(fm_spec["effort"]), "fm/final", fm_spec.get("temperature"), attempt_path)
                 r["model_req"] = args.model
                 calls.append(r)
                 candidate_final = r["parsed"]
                 if candidate_final is None:
                     raise RuntimeError("final review returned no response passing structured schema validation; raw response was preserved")
+                candidate_final["decision_context"] = decision_context
                 try:
                     candidate_check_f = validate_candidate(candidate_final, stats, r["label"], attempt_path, r.get("attempt_id"))
                 except Exception as exc:
                     raise RuntimeError(f"final plan failed deterministic trade validation: {exc}") from exc
+                candidate_final["position_results"] = attach_position_results(candidate_final, stats, candidate_check_f)
                 final, check_f = candidate_final, candidate_check_f
         except Exception as exc:  # Save all completed evidence, then fail the runner honestly.
             review_outcome = "incomplete"
@@ -2441,9 +2706,14 @@ def main() -> int:
     (out_dir / f"{stem}.md").write_text(md, encoding="utf-8")
     payload = {"date": args.date, "run_id": run_id, "models": models,
                "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-               "reports": {tk: {k: v for k, v in r.items() if k not in ("pm_decision", "research_manager", "risk_debate")}
+               "reports": {tk: {k: r.get(k) for k in
+                                ("ticker", "report_dir", "analysis_date", "generated_utc", "source_status",
+                                 "research_brief", "legacy_evidence")}
                            for tk, r in reports.items()},
-               "stats": stats, "macro": macro, "draft": draft, "draft_check": check_d, "debate": debate,
+               "stats": stats, "macro": macro, "decision_context": decision_context,
+               "candidate_coverage": (final or draft or {}).get("candidate_coverage", []),
+               "position_results": (final or draft or {}).get("position_results", []),
+               "draft": draft, "draft_check": check_d, "debate": debate,
                "final": final, "final_check": check_f, "diff_vs_draft": diff_plans(draft, final),
                "llm_calls": [{k: v for k, v in c.items() if k not in ("content", "parsed")} for c in calls],
                "raw_text_fallbacks": [c["content"] for c in calls if c.get("parsed") is None and c.get("content")],

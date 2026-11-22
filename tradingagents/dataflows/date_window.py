@@ -3,7 +3,7 @@
 - ``as_of`` / ``as_of_window`` clamp a date or window the model asks for to the
   trade date, so no tool reaches a vendor with a later one, and always hand it
   over as ``YYYY-MM-DD``: vendors compare dates as text.
-- ``in_window`` trims dated items (news, StockTwits, Reddit) to the analysis
+- ``in_window`` trims dated items (news and StockTwits) to the analysis
   window: timestamps normalized to UTC, the upper bound exclusive at midnight
   after ``end``, and an undated item kept only when the window reaches the
   present, since a backtest cannot prove it is not from the future (#1126, #1220).
@@ -47,7 +47,7 @@ def coverage_gap(
 ) -> str | None:
     """Placeholder for a window a feed did not fully observe, else None.
 
-    Yahoo news and the Reddit and StockTwits feeds return their latest items
+    Yahoo news and the StockTwits feed return their latest items
     whatever window is asked for, so "none found" over a window they never
     observed would claim an absence nobody saw. A window is observed when
     coverage reaches its first day and it ends by today; an empty result is then

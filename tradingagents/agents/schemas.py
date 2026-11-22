@@ -87,6 +87,97 @@ class TraderAction(StrEnum):
     SELL = "Sell"
 
 
+class InstrumentOutlook(StrEnum):
+    ATTRACTIVE = "attractive"
+    NEUTRAL = "neutral"
+    AVOID = "avoid"
+    UNCLEAR = "unclear"
+
+
+class InstrumentHypothesis(BaseModel):
+    """Research conclusion from the trader node, without an account action."""
+
+    outlook: InstrumentOutlook = Field(description="Instrument-level outlook, not a user-specific trade.")
+    reasoning: str = Field(description="Evidence-based instrument thesis and counterarguments.")
+    entry_conditions: list[str] = Field(default_factory=list, description="Market conditions that could improve entry attractiveness.")
+    invalidation_conditions: list[str] = Field(default_factory=list, description="Evidence or price conditions that weaken the thesis.")
+
+
+class ValuationRange(BaseModel):
+    low: float
+    high: float
+
+
+class InstrumentSentiment(BaseModel):
+    summary: str
+    as_of: str | None = None
+
+
+class ConditionalLevel(BaseModel):
+    condition: str
+    level: float | None = None
+    meaning: str
+
+
+class EvidenceDate(BaseModel):
+    source: str
+    as_of: str | None = None
+
+
+class InstrumentValuation(BaseModel):
+    target_price: float | None = None
+    target_range: ValuationRange | None = None
+    method: str
+    assumptions: str
+
+
+class InstrumentResearchBrief(BaseModel):
+    """Versioned instrument research handoff; deliberately contains no portfolio sizing."""
+
+    outlook: InstrumentOutlook
+    thesis: str
+    counter_thesis: str
+    valuation: InstrumentValuation
+    thesis_horizon: str | None = None
+    catalysts: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    sentiment: InstrumentSentiment
+    conditional_levels: list[ConditionalLevel] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"]
+    unknowns: list[str] = Field(default_factory=list)
+    evidence_dates: list[EvidenceDate] = Field(default_factory=list)
+
+
+def render_instrument_hypothesis(plan: InstrumentHypothesis) -> str:
+    return "\n".join([
+        f"**Instrument Outlook**: {plan.outlook.value}", "",
+        f"**Reasoning**: {plan.reasoning}", "",
+        "**Potential Entry Conditions**: " + ("; ".join(plan.entry_conditions) or "not established"), "",
+        "**Thesis Invalidation Conditions**: " + ("; ".join(plan.invalidation_conditions) or "not established"),
+    ])
+
+
+def render_instrument_research_brief(brief: InstrumentResearchBrief) -> str:
+    valuation = brief.valuation
+    target = valuation.target_price
+    target_range = valuation.target_range
+    return "\n".join([
+        f"**Instrument Outlook**: {brief.outlook.value}", "",
+        f"**Thesis**: {brief.thesis}", "",
+        f"**Counter Thesis**: {brief.counter_thesis}", "",
+        f"**Valuation Target**: {target if target is not None else 'not established'}", "",
+        f"**Valuation Range**: {f'{target_range.low}–{target_range.high}' if target_range else 'not established'}", "",
+        f"**Valuation Method and Assumptions**: {valuation.method}; {valuation.assumptions}", "",
+        f"**Thesis Horizon**: {brief.thesis_horizon or 'not established'}", "",
+        "**Catalysts**: " + ("; ".join(brief.catalysts) or "none established"), "",
+        "**Risks**: " + ("; ".join(brief.risks) or "none established"), "",
+        f"**Sentiment ({brief.sentiment.as_of or 'date unknown'})**: {brief.sentiment.summary}", "",
+        "**Conditional Levels**: " + ("; ".join(f"{x.condition}: {x.level if x.level is not None else 'unspecified'} ({x.meaning})" for x in brief.conditional_levels) or "none established"), "",
+        f"**Confidence**: {brief.confidence}", "",
+        "**Unknowns**: " + ("; ".join(brief.unknowns) or "none reported"),
+    ])
+
+
 # ---------------------------------------------------------------------------
 # Research Manager
 # ---------------------------------------------------------------------------
@@ -127,6 +218,21 @@ class ResearchPlan(BaseModel):
     )
 
 
+class InstrumentResearchPlan(BaseModel):
+    """Instrument thesis for the research-only profile; contains no allocation fields."""
+
+    outlook: InstrumentOutlook
+    rationale: str
+    counter_thesis: str
+    valuation: InstrumentValuation
+    thesis_horizon: str | None = None
+    catalysts: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    sentiment: InstrumentSentiment
+    conditional_levels: list[ConditionalLevel] = Field(default_factory=list)
+    unknowns: list[str] = Field(default_factory=list)
+
+
 def render_research_plan(plan: ResearchPlan) -> str:
     """Render a ResearchPlan to markdown for storage and the trader's prompt context."""
     return "\n".join([
@@ -135,6 +241,23 @@ def render_research_plan(plan: ResearchPlan) -> str:
         f"**Rationale**: {plan.rationale}",
         "",
         f"**Strategic Actions**: {plan.strategic_actions}",
+    ])
+
+
+def render_instrument_research_plan(plan: InstrumentResearchPlan) -> str:
+    valuation = plan.valuation
+    target_range = valuation.target_range
+    return "\n".join([
+        f"**Instrument Outlook**: {plan.outlook.value}", "",
+        f"**Thesis**: {plan.rationale}", "",
+        f"**Counter Thesis**: {plan.counter_thesis}", "",
+        f"**Valuation**: target {valuation.target_price if valuation.target_price is not None else 'unknown'}; range {f'{target_range.low}–{target_range.high}' if target_range else 'unknown'}; method {valuation.method}; assumptions {valuation.assumptions}", "",
+        f"**Thesis Horizon**: {plan.thesis_horizon or 'unknown'}", "",
+        "**Catalysts**: " + ("; ".join(plan.catalysts) or "none established"), "",
+        "**Risks**: " + ("; ".join(plan.risks) or "none established"), "",
+        f"**Sentiment ({plan.sentiment.as_of or 'date unknown'})**: {plan.sentiment.summary}", "",
+        "**Conditional Levels**: " + ("; ".join(f"{x.condition}: {x.level if x.level is not None else 'unspecified'} ({x.meaning})" for x in plan.conditional_levels) or "none established"), "",
+        "**Unknowns**: " + ("; ".join(plan.unknowns) or "none reported"),
     ])
 
 

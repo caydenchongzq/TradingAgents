@@ -39,17 +39,21 @@ def _stats():
 def main() -> int:
     import pandas as pd
     import types
+    provider_timezone = timezone(timedelta(hours=-5))
+    reference = datetime.now(provider_timezone).replace(hour=16, minute=30, second=0, microsecond=0)
+    previous = reference - timedelta(days=5)
+    upcoming = reference + timedelta(days=10)
     earnings_frame = pd.DataFrame({
         "EPS Estimate": [1.25, 1.50], "Reported EPS": [1.40, float("nan")],
         "Surprise(%)": [12.0, float("nan")],
-    }, index=pd.DatetimeIndex(["2026-11-05 16:30:00-05:00", "2026-11-20 16:30:00-05:00"]))
+    }, index=pd.DatetimeIndex([previous, upcoming]))
     fake_yf = types.ModuleType("yfinance")
     fake_yf.Ticker = lambda _ticker: types.SimpleNamespace(get_earnings_dates=lambda limit: earnings_frame)
     with patch.dict("sys.modules", {"yfinance": fake_yf}):
-        earnings = fm._earnings_info("AAA", datetime.strptime("2026-11-10", "%Y-%m-%d").date())
-    assert earnings["last"] == "2026-11-05" and earnings["date"] == "2026-11-20", earnings
-    assert earnings["last_datetime"] == "2026-11-05T16:30:00-05:00", earnings
-    assert earnings["next_datetime"] == "2026-11-20T16:30:00-05:00", earnings
+        earnings = fm._earnings_info("AAA", reference.date())
+    assert earnings["last"] == previous.date().isoformat() and earnings["date"] == upcoming.date().isoformat(), earnings
+    assert earnings["last_datetime"] == previous.isoformat(), earnings
+    assert earnings["next_datetime"] == upcoming.isoformat(), earnings
     assert earnings["reported_eps"] == 1.4 and earnings["estimated_eps"] == 1.5, earnings
     assert earnings["last_event"]["reported_eps"] == 1.4
     assert earnings["next_event"]["estimated_eps"] == 1.5

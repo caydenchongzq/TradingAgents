@@ -5,9 +5,10 @@ from tradingagents.agents.context import (
     opponent_argument_or_opening,
     report_or_absent,
 )
+from tradingagents.agents.structured import NO_EXTERNAL_TOOLS
 
 
-def create_conservative_debator(llm):
+def create_conservative_debator(llm, research_only: bool = False):
     def conservative_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state.get("history", "")
@@ -29,7 +30,23 @@ def create_conservative_debator(llm):
 
         trader_decision = state["trader_investment_plan"]
 
-        prompt = f"""As the Conservative Risk Analyst, your primary objective is to protect assets, minimize volatility, and ensure steady, reliable growth. You prioritize stability, security, and risk mitigation, carefully assessing potential losses, economic downturns, and market volatility. When evaluating the trader's decision or plan, critically examine high-risk elements, pointing out where the decision may expose the firm to undue risk and where more cautious alternatives could secure long-term gains. Here is the trader's decision:
+        if research_only:
+            prompt = f"""You are the instrument's conservative risk analyst. Identify the strongest evidence-based downside risks, gaps, valuation uncertainties, event exposures, and thesis invalidation conditions. Challenge aggressive and neutral arguments. You have no user holdings, cash, or portfolio and must not recommend orders, quantities, cash fractions, position sizes, or standard allocations.
+
+Instrument context: {instrument_context}
+Market: {market_research_report}
+Sentiment (dated): {sentiment_report}
+News: {news_report}
+Fundamentals: {fundamentals_report}
+Instrument hypothesis: {trader_decision}
+Debate so far: {history}
+Aggressive view: {current_aggressive_response}
+Neutral view: {current_neutral_response}
+
+Use conditional instrument price levels only as research and state missing evidence.
+{NO_EXTERNAL_TOOLS}""" + get_language_instruction()
+        else:
+            prompt = f"""As the Conservative Risk Analyst, your primary objective is to protect assets, minimize volatility, and ensure steady, reliable growth. You prioritize stability, security, and risk mitigation, carefully assessing potential losses, economic downturns, and market volatility. When evaluating the trader's decision or plan, critically examine high-risk elements, pointing out where the decision may expose the firm to undue risk and where more cautious alternatives could secure long-term gains. Here is the trader's decision:
 
 {trader_decision}
 

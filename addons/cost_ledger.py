@@ -16,6 +16,7 @@ import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import model_inventory
 
 DEFAULT_WEEKLY_USD = 25.0
 DEFAULT_NATIVE_ESTIMATE = 2.0
@@ -24,16 +25,16 @@ DEFAULT_FALLBACK_MODEL = "openai/gpt-6.1-sol"
 
 
 def models_path() -> Path:
-    return Path(__file__).resolve().parent / "openrouter_models.json"
+    return model_inventory.models_path()
 
 
 def load_models(path: Path | None = None) -> list[dict]:
-    file = path or models_path()
-    if not file.is_file():
-        return []
-    data = json.loads(file.read_text(encoding="utf-8"))
-    rows = data.get("models") if isinstance(data, dict) else data
-    return [row for row in rows or [] if isinstance(row, dict)]
+    try:
+        return model_inventory.load_snapshot(path or models_path()).get("models", [])
+    except model_inventory.InventoryError:
+        # Cost accounting must keep a malformed inventory visible to its caller
+        # rather than silently replacing it with a rate-free table.
+        raise
 
 
 def match_model(model_id: str | None, rows: list[dict] | None = None) -> dict | None:
@@ -44,9 +45,9 @@ def match_model(model_id: str | None, rows: list[dict] | None = None) -> dict | 
     exact = [row for row in rows if row.get("id") == model_id]
     if exact:
         return exact[0]
-    prefix = [row for row in rows if model_id.startswith(str(row.get("id") or ""))]
-    if prefix:
-        return max(prefix, key=lambda row: len(str(row.get("id") or "")))
+    alias = [row for row in rows if model_id in (row.get("legacy_ids") or [])]
+    if alias:
+        return alias[0]
     return None
 
 
@@ -54,8 +55,7 @@ def price_tokens(model_id: str | None, tokens_in, tokens_out, rows: list[dict] |
     row = match_model(model_id, rows)
     if row is None:
         return None
-    pin = row.get("usd_per_mtok_in")
-    pout = row.get("usd_per_mtok_out")
+    pin, pout = model_inventory.token_rates(row, tokens_in)
     if not isinstance(pin, (int, float)) or not isinstance(pout, (int, float)):
         return None
     inn = float(tokens_in or 0)

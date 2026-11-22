@@ -7,6 +7,7 @@ run produces the same on-disk report tree a CLI run does.
 """
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 
 from tradingagents.agents.rating import run_rating
@@ -22,6 +23,7 @@ def _header(ticker: str, final_state: dict, settings: dict | None) -> str:
     lines = [f"# Trading Analysis Report: {ticker}", ""]
     if final_state.get("trade_date"):
         lines.append(f"- Analysis date: {final_state['trade_date']}")
+    lines.append(f"- Analysis profile: {'research_only' if final_state.get('research_only') else 'portfolio_aware'}")
     if final_state.get("final_trade_decision"):
         lines.append(f"- Rating: {run_rating(final_state)}")
     lines.append(f"- Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')}")
@@ -86,6 +88,19 @@ def _report_parts(final_state: dict) -> list[tuple[str, str, list[tuple[str, str
                 written.append((agent, filename, value))
         if written:
             parts.append((heading, folder, written))
+    if final_state.get("research_only"):
+        parts = [
+            ("II. Instrument Research Debate", folder, written)
+            if folder == "2_research" else
+            ("III. Instrument Hypothesis", folder, written)
+            if folder == "3_trading" else
+            ("IV. Instrument Risk Review", folder, written)
+            if folder == "4_risk" else
+            ("V. Instrument Research Brief", folder, written)
+            if folder == "5_portfolio" else
+            (heading, folder, written)
+            for heading, folder, written in parts
+        ]
     return parts
 
 
@@ -113,6 +128,24 @@ def write_report_tree(final_state: dict, ticker: str, save_path, settings: dict 
     (save_path / "complete_report.md").write_text(
         _header(ticker, final_state, settings) + "\n\n".join(sections), encoding="utf-8"
     )
+    brief = final_state.get("research_brief") if final_state.get("research_only") else None
+    brief_path = save_path / "research_brief.json"
+    if brief is not None:
+        payload = {
+            "schema_version": 1,
+            "profile": "research_only",
+            "ticker": ticker,
+            "analysis_date": final_state.get("trade_date"),
+            "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            **brief,
+        }
+        temp_path = brief_path.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temp_path.replace(brief_path)
+    else:
+        # A reused report directory must not retain an old research brief after
+        # a standard-mode run or a research-mode structured-output failure.
+        brief_path.unlink(missing_ok=True)
     if html:
         from tradingagents.report_html import render_report
 

@@ -35,8 +35,9 @@ def _check_large_ranking_context_and_truncation() -> None:
         ([{"source": "yfinance", "title": f"Yahoo headline {i}"} for i in range(8)]
          + [{"source": "alpha_vantage", "title": f"AV headline {i}", "summary": "Summary"} for i in range(8)]),
         [{"id": f"sector_{ticker}", "rs_1m": -1.2} for ticker in sector_etfs],
-        sector_etfs, names, ranked, [f"theme_{i}" for i in range(12)])
+        sector_etfs, names, ranked)
     parsed = json.loads(context)
+    assert "subthemes" not in parsed
     tickers = [row["ticker"] for row in parsed["names"]]
     assert len(tickers) == 110 and len(set(tickers)) == 110
     assert set(tickers) == {row["ticker"] for row in names}
@@ -150,7 +151,8 @@ def _check_main_proposal_flow() -> None:
     watch = [{"ticker": "AAA", "sector": "Technology", "type": "stock"}]
     wrapper = {"items": watch, "metadata": "preserve me"}
     (root / "watchlist.json").write_text(json.dumps(wrapper), encoding="utf-8")
-    (root / "my_book.json").write_text(json.dumps({"positions": [{"ticker": "BBB"}]}), encoding="utf-8")
+    (root / "my_book.json").write_text(json.dumps({"cash": 0, "positions": [
+        {"ticker": "BBB", "quantity": 1, "average_price": 10}]}), encoding="utf-8")
     frame = pd.DataFrame()
     parsed = {
         "headline": "test",
@@ -336,6 +338,7 @@ def main() -> int:
         scores, min_n=30, max_n=50, shadow=False, as_of="2026-11-06")
     actions = [c["action"] for c in changes]
     assert "add" in actions, changes
+    assert "sub_theme" not in updated[-1] and "sub_theme" not in ts.load_watchlist.__code__.co_consts
     assert actions.count("drop") == 4, changes  # legacy min_n no longer blocks reviewed drops
     assert not any(c["action"] == "kept" and c["ticker"] == "N03" for c in changes)
     assert len(updated) == 29
@@ -408,6 +411,10 @@ def main() -> int:
                                      {"ticker": "XLV", "quantity": 2, "average_price": 40}]}
     assert ts.book_ai_lookthrough(book, book_close, sleeve_t, tagged) == 50.0
     assert ts.book_ai_lookthrough({"positions": []}, book_close, sleeve_t, tagged) is None
+    unknown_cash_book = {**book, "cash": None}
+    assert ts.book_ai_lookthrough(unknown_cash_book, book_close, sleeve_t, tagged) is None
+    unknown_cost_book = {"cash": 100, "positions": [{"ticker": "AAA", "quantity": 2, "average_price": None}]}
+    assert ts.book_ai_lookthrough(unknown_cost_book, pd.DataFrame(index=book_close.index), sleeve_t, tagged) is None
 
     held_drop, held_changes = ts.apply_watchlist(
         items, [], [{"ticker": "N00", "reason": "sell"}], scores,

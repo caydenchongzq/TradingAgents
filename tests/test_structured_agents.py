@@ -466,6 +466,40 @@ class TestSentimentAnalystAgent:
         assert len(result["messages"]) == 1
         assert result["sentiment_report"] == result["messages"][0].content
 
+    def test_all_unavailable_sources_return_without_invented_score_or_model_call(self, monkeypatch):
+        from tradingagents.agents.analysts import sentiment_analyst as sentiment
+
+        monkeypatch.setattr(sentiment.get_news, "func", lambda *a, **k: "DATA_UNAVAILABLE: private provider detail", raising=False)
+        monkeypatch.setattr(sentiment, "fetch_stocktwits_messages", lambda *a, **k: "<stocktwits unavailable: access denied>")
+        monkeypatch.setattr(sentiment, "fetch_reddit_posts", lambda *a, **k: "<Reddit unavailable: public RSS was retired>")
+        llm = MagicMock()
+        llm.with_structured_output.return_value = MagicMock()
+
+        result = create_sentiment_analyst(llm)(_make_sentiment_state())
+
+        assert "Sentiment unavailable" in result["sentiment_report"]
+        assert "(Score:" not in result["sentiment_report"]
+        assert "neutral" not in result["sentiment_report"].lower()
+        assert "private provider detail" not in result["sentiment_report"]
+        assert "RSS is retired" in result["sentiment_report"]
+        assert result["messages"][0].content == result["sentiment_report"]
+        llm.with_structured_output.return_value.invoke.assert_not_called()
+        llm.invoke.assert_not_called()
+
+    def test_untrusted_unavailable_word_does_not_skip_sentiment_model(self, monkeypatch):
+        from tradingagents.agents.analysts import sentiment_analyst as sentiment
+
+        monkeypatch.setattr(sentiment.get_news, "func", lambda *a, **k: "A headline says its service was unavailable last year.", raising=False)
+        monkeypatch.setattr(sentiment, "fetch_stocktwits_messages", lambda *a, **k: "Screening unavailable. A post says the app is unavailable.")
+        monkeypatch.setattr(sentiment, "fetch_reddit_posts", lambda *a, **k: "<Reddit unavailable: public RSS was retired>")
+        captured = {}
+        llm = _structured_sentiment_llm(captured)
+
+        result = create_sentiment_analyst(llm)(_make_sentiment_state())
+
+        assert "Overall Sentiment" in result["sentiment_report"]
+        llm.with_structured_output.return_value.invoke.assert_called_once()
+
     def test_prompt_contains_ticker(self):
         captured = {}
         create_sentiment_analyst(_structured_sentiment_llm(captured))(_make_sentiment_state())

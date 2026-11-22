@@ -152,4 +152,17 @@ with tempfile.TemporaryDirectory() as tmp:
     assert recovered_orphan["source_sha256"] == orphan_hash
     assert recovered_orphan["status"] == "schema_valid"
     assert recovered_orphan["trade_validation_status"] == "not_run_missing_report_stats"
+    v2_candidate = {**candidate, "decision_contract_version": 2,
+                    "candidate_coverage": [{"ticker": "NEW", "disposition": "watch", "rationale": "Wait for evidence.",
+                                            "research_status": "missing", "source_profile": "missing",
+                                            "evidence_date": None}]}
+    v2_dir = orphan_dir / "v2"
+    v2_dir.mkdir()
+    v2_journal = v2_dir / "response_attempts.jsonl"
+    fm._append_attempt(v2_journal, {"event":"response", "attempt":1, "attempt_id":"v2-attempt",
+        "label":"fm/draft", "schema_name":"fund_manager_draft_v2", "mode":"json_object",
+        "created_utc":"2026-11-17T00:00:00Z", "usage":{"prompt_tokens":1,"completion_tokens":1},
+        "model_returned":"test-model", "content":json.dumps(v2_candidate)})
+    recovered_v2 = json.loads(reprocess(v2_journal, 1).read_text())
+    assert recovered_v2["status"] == "schema_valid" and recovered_v2["schema_name"] == "fund_manager_draft_v2", recovered_v2
 print("check_response_recovery: ok")

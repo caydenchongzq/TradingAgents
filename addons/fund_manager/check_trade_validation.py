@@ -102,6 +102,27 @@ def main():
     unknown = fixture(cash=None, available=None)
     rejected(run([order("SELL", 15, decision="exit"), order("BUY", 10, "NEW")], unknown))
     assert run([order("HOLD", 0)], unknown)["trades"][0]["status"] == "hold"
+    # Future conditions remain advice: no quote/cash requirement and no
+    # effective shares, fees, cash movement, or sale proceeds.
+    deferred_buy = order("BUY", 10, "NEW", decision="new_position", execution_intent="deferred",
+                         condition="Only if price closes below 90", target_shares=20)
+    deferred_buy_result = run([deferred_buy], fixture(cash=None, available=None))
+    buy_row = deferred_buy_result["trades"][0]
+    assert buy_row["status"] == "deferred" and buy_row["proposed_shares"] == 10
+    assert buy_row["effective_shares"] == buy_row["shares"] == buy_row["fee_usd"] == buy_row["cash_delta_usd"] == 0
+    assert deferred_buy_result["ending_cash"] is None and deferred_buy_result["fees_usd"] == 0
+    deferred_sell = order("SELL", 5, decision="trim", execution_intent="deferred",
+                          condition="After the earnings event", target_shares=10)
+    deferred_sell_result = run([deferred_sell], fixture(cash=None, available=None))
+    assert deferred_sell_result["trades"][0]["status"] == "deferred"
+    assert deferred_sell_result["trades"][0]["cash_delta_usd"] == 0
+    assert deferred_sell_result["accounts_after"][0]["positions"][0]["quantity"] == 15
+    rejected(run([order("SELL", 16, decision="trim", execution_intent="deferred",
+                        condition="Later")]))
+    rejected(run([order("BUY", 1, "UNRESEARCHED", decision="new_position",
+                        execution_intent="deferred", condition="Later")]))
+    rejected(run([order("BUY", 10, "NEW", decision="new_position",
+                        execution_intent="deferred", condition=" ")]))
     # Failed/rejected proposals have no accounting effects or model-price escape.
     for value in (-1, 0, True, math.inf, math.nan, .5, "10"):
         rejected(run([order("BUY", value)]))

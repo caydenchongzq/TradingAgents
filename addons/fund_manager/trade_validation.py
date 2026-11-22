@@ -143,6 +143,7 @@ def validate_trades(decision: dict, stats: dict, policy: dict | None = None) -> 
                   "cash_delta_usd": 0.0, "status": "rejected", "reason": None,
                   "execution_order": None}
         reason, adjustment = None, None
+        execution_intent = str(proposal.get("execution_intent") or "").lower()
         if duplicate:
             reason = "duplicate account/instrument row; first proposal retained"
         elif aid not in by_id:
@@ -158,10 +159,39 @@ def validate_trades(decision: dict, stats: dict, policy: dict | None = None) -> 
         elif action == "HOLD":
             if requested != 0:
                 reason = "HOLD requires zero shares"
+            elif execution_intent not in ("", "none"):
+                reason = "HOLD requires execution_intent none"
             else:
                 result.update(status="hold", reason="no order")
         elif requested == 0:
             reason = "an actionable order requires positive shares"
+        elif execution_intent == "none":
+            reason = "BUY/SELL requires current or deferred execution intent"
+        elif execution_intent == "deferred":
+            condition = str(proposal.get("condition") or "").strip()
+            if not condition:
+                reason = "deferred recommendation requires an explicit future condition"
+            elif action == "BUY" and requested != requested.to_integral_value():
+                reason = "deferred buys require whole shares"
+            elif action == "SELL" and key not in holdings:
+                reason = "deferred sale requires a position in this account"
+            elif action == "SELL" and requested > quantities.get(key, Decimal(0)):
+                reason = "deferred sale quantity exceeds account holding"
+            elif action == "SELL" and requested > (_number(holdings[key].get("sellable_quantity"))
+                                                        if _number(holdings[key].get("sellable_quantity")) is not None
+                                                        else quantities[key]):
+                reason = "deferred sale quantity exceeds verified available units"
+            elif action == "SELL" and requested != requested.to_integral_value() and requested != (
+                    _number(holdings[key].get("sellable_quantity"))
+                    if _number(holdings[key].get("sellable_quantity")) is not None else quantities[key]):
+                reason = "fractional deferred sales are allowed only for a complete available-position exit"
+            else:
+                result.update(status="deferred", reason=condition,
+                              deferred_condition=condition, effective_shares=0.0,
+                              shares=0.0, fee_usd=0.0, value_usd=0.0,
+                              cash_delta_usd=0.0, execution_order=None)
+        elif execution_intent not in ("", "current"):
+            reason = "execution_intent must be current, deferred, or none"
         elif str(proposal.get("order_type") or "").lower() == "staged":
             reason = "staged proposals need concrete single orders to estimate fees"
         elif ticker not in quotes:

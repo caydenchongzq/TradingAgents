@@ -6,7 +6,7 @@ from tradingagents.agents.context import (
 )
 
 
-def create_bear_researcher(llm):
+def create_bear_researcher(llm, research_only: bool = False):
     def bear_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
@@ -28,7 +28,12 @@ def create_bear_researcher(llm):
             else "Asset fundamentals report (may be unavailable for crypto)"
         )
 
-        prompt = f"""You are a Bear Analyst making the case against investing in the {target_label}. Your goal is to present a well-reasoned argument emphasizing risks, challenges, and negative indicators. Leverage the provided research and data to highlight potential downsides and counter bullish arguments effectively.
+        profile_guidance = (
+            "Make an instrument-level case only. You do not know the user's holdings, cash, or portfolio; do not recommend transaction sizes, order timing, or allocation."
+            if research_only
+            else ""
+        )
+        prompt = f"""You are a Bear Analyst making the case against investing in the {target_label}. Your goal is to present a well-reasoned argument emphasizing risks, challenges, and negative indicators. Leverage the provided research and data to highlight potential downsides and counter bullish arguments effectively. {profile_guidance}
 
 Key points to focus on:
 

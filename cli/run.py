@@ -56,13 +56,14 @@ def _announce_checkpoint_state(graph, ticker: str, trade_date: str) -> None:
         message_buffer.add_message("System", f"Starting fresh for {ticker} on {trade_date}")
 
 
-def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
+def _build_run_config(selections: dict, checkpoint: bool | None, research_only: bool = False) -> dict:
     """Assemble the run config from interactive selections, honoring env precedence.
 
     Round counts and checkpoint follow "explicit env/flag wins": an env-applied
     value on DEFAULT_CONFIG is preserved unless the user overrode it on the CLI.
     """
     config = DEFAULT_CONFIG.copy()
+    config["research_only"] = research_only
     # Research depth sets both round counts, but an explicit env override
     # (TRADINGAGENTS_MAX_DEBATE_ROUNDS / _MAX_RISK_ROUNDS) wins over the
     # interactive selection — leave the env-applied value in place (#977).
@@ -110,7 +111,7 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
 
     selections = get_user_selections(flags)
 
-    config = _build_run_config(selections, checkpoint)
+    config = _build_run_config(selections, checkpoint, bool(flags.get("research_only")))
 
     stats_handler = StatsCallbackHandler()
 

@@ -23,6 +23,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The native prompt adapter reads this before it wraps any seat. Set it from
+# the CLI flag as well as the managed launch environment so direct research
+# runs get the same custom-prompt boundary.
+if "--research-only" in sys.argv[1:] or os.getenv("ARGUS_RESEARCH_ONLY") == "1":
+    os.environ["ARGUS_RESEARCH_ONLY"] = "1"
+
 # Token totals are already collected by the CLI's StatsCallbackHandler, but nothing
 # writes them down. Cost in USD is logged only when the provider payload carries it
 # (OpenRouter does not, unless the client asks for usage.include, which lives in
@@ -187,6 +193,9 @@ def _install_macro_context() -> None:
     raw = os.environ.get("ARGUS_MACRO_CONTEXT_FILE", "").strip()
     if not raw:
         return
+    if os.environ.get("ARGUS_RESEARCH_ONLY") == "1":
+        print("[run_native] macro context is not permitted in research-only mode", flush=True)
+        raise SystemExit(2)
     path = Path(raw)
     if not path.is_file():
         print(f"[run_native] macro context file missing: {path}", flush=True)

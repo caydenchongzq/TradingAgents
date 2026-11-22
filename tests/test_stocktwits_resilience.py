@@ -46,6 +46,52 @@ class TestStockTwitsResilience:
         assert "unavailable" in out.lower()
         assert out.startswith("<stocktwits unavailable")
 
+    @pytest.mark.parametrize(
+        ("status", "reason"),
+        [(401, "authentication required"), (403, "access denied"),
+         (404, "symbol endpoint not found"), (429, "rate limited")],
+    )
+    def test_http_failures_are_classified_without_retry_or_body_logging(self, status, reason, caplog):
+        error = HTTPError("https://example.invalid", status, "secret body", {}, None)
+        with patch.object(stocktwits, "urlopen", side_effect=error) as urlopen:
+            result = stocktwits.fetch_stocktwits_messages("NVDA")
+        assert reason in result
+        assert "secret body" not in caplog.text
+        urlopen.assert_called_once()
+
+    def test_invalid_json_and_malformed_messages_are_unavailable(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b"\xff"
+
+        with patch.object(stocktwits, "urlopen", return_value=Response()):
+            assert "malformed JSON" in stocktwits.fetch_stocktwits_messages("NVDA")
+        for message in ({"body": "text", "created_at": []},
+                        {"body": "text", "entities": {"sentiment": []}},
+                        {}, {"body": ""}, {"body": " \n\t "},
+                        {"body": "&nbsp;"}):
+            with patch.object(stocktwits, "urlopen", return_value=_payload({"messages": [message]})):
+                assert "malformed message payload" in stocktwits.fetch_stocktwits_messages("NVDA")
+
+    def test_empty_message_list_is_a_successful_empty_result(self):
+        with patch.object(stocktwits, "urlopen", return_value=_payload({"messages": []})):
+            result = stocktwits.fetch_stocktwits_messages("NVDA")
+        assert "no StockTwits messages found" in result
+        assert "unavailable" not in result
+
+    def test_optional_timestamp_user_and_entities_remain_supported(self):
+        message = {"body": "A valid message without optional metadata", "user": None, "entities": None}
+        with patch.object(stocktwits, "urlopen", return_value=_payload({"messages": [message]})):
+            result = stocktwits.fetch_stocktwits_messages("NVDA")
+        assert "A valid message without optional metadata" in result
+        assert "Total: 1" in result
+
 
 @pytest.mark.unit
 class TestStockTwitsCryptoSymbols:
@@ -85,6 +131,19 @@ def _stream(*bodies):
         for b in bodies
     ]}
 
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(payload).encode()
+    return _Resp()
+
+
+def _payload(payload):
     class _Resp:
         def __enter__(self):
             return self

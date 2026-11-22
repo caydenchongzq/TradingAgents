@@ -20,13 +20,19 @@ TOOLS = (
 )
 
 
-def create_fundamentals_analyst(llm):
+def create_fundamentals_analyst(llm, research_only: bool = False):
     def fundamentals_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = get_instrument_context_from_state(state)
 
+        profile_guidance = (
+            "Assess the instrument's business and financial quality, valuation evidence, risks, and unknowns. Do not recommend user-specific orders, share quantities, cash use, or portfolio allocations."
+            if research_only
+            else "Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
+        )
         system_message = (
-            "You are a researcher tasked with analyzing fundamental information over the past week about a company. Please write a comprehensive report of the company's fundamental information such as financial documents, company profile, basic company financials, and company financial history to gain a full view of the company's fundamental information to inform traders. Make sure to include as much detail as possible. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
+            "You are a researcher tasked with analyzing fundamental information over the past week about a company. Please write a comprehensive report of the company's fundamental information such as financial documents, company profile, basic company financials, and company financial history to gain a full view of the company's fundamental information to inform traders. Make sure to include as much detail as possible. "
+            + profile_guidance
             + " Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."
             + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements, and `get_insider_transactions` for recent insider buying and selling."
             + get_language_instruction()

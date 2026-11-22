@@ -5,9 +5,10 @@ from tradingagents.agents.context import (
     opponent_argument_or_opening,
     report_or_absent,
 )
+from tradingagents.agents.structured import NO_EXTERNAL_TOOLS
 
 
-def create_aggressive_debator(llm):
+def create_aggressive_debator(llm, research_only: bool = False):
     def aggressive_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state.get("history", "")
@@ -29,7 +30,23 @@ def create_aggressive_debator(llm):
 
         trader_decision = state["trader_investment_plan"]
 
-        prompt = f"""As the Aggressive Risk Analyst, your role is to actively champion high-reward, high-risk opportunities, emphasizing bold strategies and competitive advantages. When evaluating the trader's decision or plan, focus intently on the potential upside, growth potential, and innovative benefits—even when these come with elevated risk. Use the provided market data and sentiment analysis to strengthen your arguments and challenge the opposing views. Specifically, respond directly to each point made by the conservative and neutral analysts, countering with data-driven rebuttals and persuasive reasoning. Highlight where their caution might miss critical opportunities or where their assumptions may be overly conservative. Here is the trader's decision:
+        if research_only:
+            prompt = f"""You are the instrument's aggressive risk analyst. Make the strongest evidence-based upside case and challenge conservative and neutral arguments. Discuss business execution, valuation, catalysts, market evidence, and what could invalidate the upside thesis. You do not know the user's portfolio and must not recommend account actions, quantities, position sizes, cash fractions, or standard allocations.
+
+Instrument context: {instrument_context}
+Market: {market_research_report}
+Sentiment (dated): {sentiment_report}
+News: {news_report}
+Fundamentals: {fundamentals_report}
+Instrument hypothesis: {trader_decision}
+Debate so far: {history}
+Conservative view: {current_conservative_response}
+Neutral view: {current_neutral_response}
+
+Respond directly to evidence and uncertainties. Discuss instrument price levels only as conditional research, not orders. Do not assume portfolio context.
+{NO_EXTERNAL_TOOLS}""" + get_language_instruction()
+        else:
+            prompt = f"""As the Aggressive Risk Analyst, your role is to actively champion high-reward, high-risk opportunities, emphasizing bold strategies and competitive advantages. When evaluating the trader's decision or plan, focus intently on the potential upside, growth potential, and innovative benefits—even when these come with elevated risk. Use the provided market data and sentiment analysis to strengthen your arguments and challenge the opposing views. Specifically, respond directly to each point made by the conservative and neutral analysts, countering with data-driven rebuttals and persuasive reasoning. Highlight where their caution might miss critical opportunities or where their assumptions may be overly conservative. Here is the trader's decision:
 
 {trader_decision}
 

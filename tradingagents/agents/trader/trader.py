@@ -9,7 +9,12 @@ from tradingagents.agents.context import (
     get_language_instruction,
     get_portfolio_context_from_state,
 )
-from tradingagents.agents.schemas import TraderProposal, render_trader_proposal
+from tradingagents.agents.schemas import (
+    InstrumentHypothesis,
+    TraderProposal,
+    render_instrument_hypothesis,
+    render_trader_proposal,
+)
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
     bind_structured,
@@ -17,8 +22,10 @@ from tradingagents.agents.structured import (
 )
 
 
-def create_trader(llm):
-    structured_llm = bind_structured(llm, TraderProposal, "Trader")
+def create_trader(llm, research_only: bool = False):
+    schema = InstrumentHypothesis if research_only else TraderProposal
+    renderer = render_instrument_hypothesis if research_only else render_trader_proposal
+    structured_llm = bind_structured(llm, schema, "Trader")
 
     def trader_node(state):
         company_name = state["company_of_interest"]
@@ -32,7 +39,10 @@ def create_trader(llm):
         market_report = (state["market_report"] or "").strip()
         portfolio_context = get_portfolio_context_from_state(state)
 
-        if market_report:
+        if research_only:
+            grounding = "Use instrument prices only to describe possible market conditions; do not recommend a user-specific entry, order, share count, stop or allocation. "
+            report_section = f"Technical Market Report:\n{market_report}\n\n" if market_report else ""
+        elif market_report:
             grounding = (
                 "Ground concrete price levels (entry, stop-loss, position sizing) in the technical "
                 "market report's price structure -- current price, support/resistance, ATR, and "
@@ -43,7 +53,22 @@ def create_trader(llm):
             grounding = ""
             report_section = ""
 
-        messages = [
+        if research_only:
+            messages = [
+                {"role": "system", "content": (
+                    "You are an instrument hypothesis reviewer. You do not know the user's holdings, cash, cost basis or portfolio. "
+                    "Assess the instrument thesis and conditions that could improve or invalidate it. Never recommend buying, selling, holding a user's position, shares, cash fractions, portfolio allocation, standard allocation, entry orders or stops. "
+                    + grounding + NO_EXTERNAL_TOOLS + get_language_instruction()
+                )},
+                {"role": "user", "content": (
+                    f"Review the research thesis for {company_name}.\n{instrument_context}\n\n{report_section}"
+                    f"Research plan:\n{investment_plan}\n\n"
+                    "Return an instrument outlook, evidence-based reasoning, possible market conditions and thesis invalidation conditions. "
+                    "Discuss absolute valuation or market levels only as uncertain instrument research, never an order."
+                )},
+            ]
+        else:
+            messages = [
             {
                 "role": "system",
                 "content": (
@@ -80,13 +105,13 @@ def create_trader(llm):
                     "- **Entry Price**, **Stop Loss**, **Position Sizing**: when you can state them"
                 ),
             },
-        ]
+            ]
 
         trader_plan = invoke_structured_or_freetext(
             structured_llm,
             llm,
             messages,
-            render_trader_proposal,
+            renderer,
             "Trader",
         )
 

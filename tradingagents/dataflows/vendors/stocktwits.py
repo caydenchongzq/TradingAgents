@@ -1,8 +1,9 @@
 """StockTwits public symbol-stream fetcher.
 
 StockTwits exposes a per-symbol message stream at
-``api.stocktwits.com/api/2/streams/symbol/{ticker}.json`` that requires no
-API key, no OAuth, and no registration. Each message includes a
+``api.stocktwits.com/api/2/streams/symbol/{ticker}.json``. This public path
+answered an unauthenticated request during a bounded check, though provider
+access may vary. Each message includes a
 user-labeled sentiment field (``Bullish``/``Bearish``/null), the message
 body, timestamp, and posting user.
 
@@ -20,6 +21,7 @@ import http.client
 import json
 import logging
 from datetime import datetime
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from tradingagents.dataflows.date_window import coverage_gap, in_window
@@ -99,13 +101,59 @@ def fetch_stocktwits_messages(
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-        # OSError covers URLError/TimeoutError/connection resets; HTTPException
-        # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).
-        logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
-        return f"<stocktwits unavailable: {type(exc).__name__}>"
+    except HTTPError as exc:
+        reasons = {
+            401: "authentication required",
+            403: "access denied",
+            404: "symbol endpoint not found",
+            429: "rate limited",
+        }
+        reason = reasons.get(exc.code, f"HTTP {exc.code}")
+        logger.warning("StockTwits request for %s failed: %s", ticker, reason)
+        return f"<stocktwits unavailable: {reason}>"
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        # Keep transport diagnostics bounded and free of response bodies or
+        # social content, which may appear in low-level exception messages.
+        timeout_error = isinstance(exc, TimeoutError) or isinstance(
+            getattr(exc, "reason", None), TimeoutError
+        )
+        reason = "timeout" if timeout_error else (
+            "malformed JSON" if isinstance(exc, ValueError) else type(exc).__name__
+        )
+        logger.warning("StockTwits request for %s failed: %s", ticker, reason)
+        return f"<stocktwits unavailable: {reason}>"
 
-    fetched = data.get("messages", []) if isinstance(data, dict) else []
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        logger.warning("StockTwits response for %s has an unexpected shape", ticker)
+        return "<stocktwits unavailable: unexpected response shape>"
+    fetched = data["messages"]
+
+    def valid_message(message):
+        if not isinstance(message, dict):
+            return False
+        body = message.get("body")
+        if not isinstance(body, str) or not _body(message).strip():
+            return False
+        if message.get("created_at") is not None and not isinstance(message["created_at"], str):
+            return False
+        user = message.get("user", {})
+        if user is not None and (
+            not isinstance(user, dict) or not isinstance(user.get("username", "?"), str)
+        ):
+            return False
+        entities = message.get("entities", {})
+        if entities is not None and not isinstance(entities, dict):
+            return False
+        entities = entities or {}
+        sentiment = entities.get("sentiment")
+        return sentiment is None or (
+            isinstance(sentiment, dict)
+            and (sentiment.get("basic") is None or isinstance(sentiment.get("basic"), str))
+        )
+
+    if not all(valid_message(message) for message in fetched):
+        logger.warning("StockTwits response for %s has malformed messages", ticker)
+        return "<stocktwits unavailable: malformed message payload>"
     messages = _within_window(fetched, start_date, end_date)
     if not messages:
         if start_date and end_date:

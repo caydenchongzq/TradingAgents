@@ -69,6 +69,7 @@ class TradingAgentsGraph:
         """
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
+        self.research_only = bool(self.config.get("research_only", False))
         self.callbacks = callbacks or []
 
         set_config(self.config)
@@ -110,6 +111,7 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.conditional_logic,
             max_tool_rounds,
+            research_only=self.research_only,
         )
 
         self.propagator = Propagator(
@@ -193,6 +195,8 @@ class TradingAgentsGraph:
         PortfolioRating enum.
         """
         trade_date = _validate_trade_date(trade_date)
+        if getattr(self, "research_only", False) and portfolio is not None:
+            raise ValueError("research-only analysis cannot receive portfolio context")
 
         with run_config(self.config), \
                 self.checkpoint_scope(company_name, trade_date, asset_type, portfolio) as thread_id_value:
@@ -284,6 +288,7 @@ class TradingAgentsGraph:
             "output_language": cfg.get("output_language"),
             "data_vendors": dict(cfg.get("data_vendors") or {}),
             "tool_vendors": dict(cfg.get("tool_vendors") or {}),
+            "profile": "research_only" if getattr(self, "research_only", False) else "portfolio_aware",
         }
 
     def save_reports(self, final_state, ticker, save_path=None, html=True) -> Path:
@@ -310,12 +315,15 @@ class TradingAgentsGraph:
         and loads them alongside the analysts (see ``_memory_step``).
         """
         trade_date = _validate_trade_date(trade_date)
+        if getattr(self, "research_only", False) and portfolio is not None:
+            raise ValueError("research-only analysis cannot receive portfolio context")
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
             asset_type=asset_type,
             instrument_context=self.resolve_instrument_context(company_name, asset_type, trade_date),
             portfolio_context=portfolio.render(company_name) if portfolio is not None else "",
+            research_only=getattr(self, "research_only", False),
         )
 
     def _memory_step(self, state):
@@ -328,6 +336,10 @@ class TradingAgentsGraph:
         does not end the run: the analysts' work is kept, the lessons already in
         the log are used, and the report says what could not be settled.
         """
+        if getattr(self, "research_only", False):
+            # Do not settle, read, or write portfolio-aware lessons in this profile.
+            return {"past_context": "", "memory_note": ""}
+
         note = ""
         try:
             # Another run settling the same log does the work; this one goes on.
@@ -372,6 +384,8 @@ class TradingAgentsGraph:
         """Record a finished run: its state log, and its decision in the memory log
         for reflection on the next same-ticker run. propagate() and the CLI both end here."""
         self._log_state(trade_date, final_state)
+        if getattr(self, "research_only", False):
+            return
         decision = final_state.get("final_trade_decision")
         if not decision:
             logger.warning("No final decision for %s on %s; nothing added to the memory log",

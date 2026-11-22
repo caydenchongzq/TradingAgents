@@ -71,3 +71,5 @@ class AgentState(MessagesState):
     past_context: Annotated[str, "Memory log context for the Portfolio Manager (same-ticker decisions + cross-ticker lessons), written by the Memory Log step"]
     memory_note: Annotated[str, "What the Memory Log step could not settle or read this run, for the report; empty when all went well"]
     portfolio_context: Annotated[str, "Caller-supplied holdings and cash, rendered at run start; empty when not provided"]
+    research_only: Annotated[bool, "Account-blind instrument research profile"]
+    research_brief: Annotated[dict, "Versioned account-blind instrument research output, when available"]

@@ -1,9 +1,11 @@
 # Theme scout
 
-A separate add-on. It does not modify TradingAgents source.
+A separate add-on. It does not modify TradingAgents source. It reads the shared account-book projection for portfolio context but does not connect to brokers or submit orders.
 
 ## Weekly scout
-One `openai/gpt-6.1-sol` call. Inputs are FRED (fed funds, 10y, 2y, curve, CPI, unemployment, VIX), a week of Yahoo and Alpha Vantage headlines, earnings dates, and 1-week / 1-month / 3-month relative strength of sector ETFs and AI sub-themes versus SPY. The model marks each sub-theme overweight, neutral, or avoid and proposes watchlist adds and drops. The list is kept between 30 and 50 names. Watchlist rules: 30–50 names, at most 5 adds and 5 drops a week, a 28-day cooldown after a name is added or dropped, holdings and staged orders are never dropped (flagged trim), new names count as AI weight 1.0 until tagged, and adds are blocked while the book is at the AI cap. The scout always writes reviewable proposals and never modifies the live watchlist. Argus proposal review and apply integration is pending; the proposal is not applied until that review flow is available and confirmed.
+One `openai/gpt-6.1-sol` call. Inputs are FRED (fed funds, 10y, 2y, curve, CPI, unemployment, VIX), a week of Yahoo and Alpha Vantage headlines, earnings dates, and 1-week / 1-month / 3-month relative strength of selected sector ETFs versus SPY. The model marks general themes overweight, neutral, or avoid and proposes watchlist adds and drops. There is no hardcoded AI subtheme taxonomy; old `sub_theme` tags are ignored. The fixed cooldown is 14 days after a name is added or dropped; weekly add/drop caps are unlimited. Holdings and staged orders are protected from drops. Adds and drops are written as reviewable proposals and do not modify the live watchlist.
+
+If any account has unknown USD cash or a held position has neither a current quote nor a usable cost, portfolio-wide AI exposure is unavailable. The scout continues to produce its free screen and reports, while leaving that whole-book metric blank.
 
 ```powershell
 cd "D:\Software Development\trading\TradingAgents"
